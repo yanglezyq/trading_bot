@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "AI-powered cryptocurrency trading assistant based on Obsidian vault knowledge"
+requires-python = ">=3.11"
+authors = [
+    {name = "Trading Bot", email = "bot@trading.local"}
+]
+
+dependencies = [
+    "anthropic>=0.40.0",           # Claude API
+    "binance-connector>=3.8.0",    # Binance API
+    "typer[all]>=0.15.0",          # CLI framework
+    "rich>=13.0.0",                # Terminal formatting
+    "pyyaml>=6.0",                 # Config parsing
+    "python-dotenv>=1.0.0",        # .env loading
+    "pandas>=2.0.0",               # Data analysis
+    "httpx>=0.27.0",               # HTTP client
+    "websocket-client>=1.8.0",     # WebSocket support
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-mock>=3.14.0",
+    "black>=24.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+trading = "trading.main:app"
+
+[tool.setuptools.packages]
+find = {where = ["src"]}
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true

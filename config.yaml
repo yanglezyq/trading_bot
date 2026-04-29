@@ -1,0 +1,97 @@
+################################################################################
+# Trading Bot Configuration
+# All parameters are read from this file and .env
+################################################################################
+
+# Obsidian Vault Configuration
+vault:
+  path: "/Users/shuchang/Documents/Obsidian Vault"
+  trading_dir: "体系化交易"
+
+  # Subdirectories for reading/writing
+  system_guide: "合约交易体系-完整指南.md"
+  position_tracking_dir: "【持仓管理】"
+  reports_dir: "【报告】"
+  decision_spec: "决策建议生成规范.md"
+  research_spec: "币种调研报告规范(v2.0-通用版).md"
+
+# Risk Management Parameters (from 合约交易体系-完整指南.md)
+risk:
+  # Account-level circuit breakers
+  max_account_drawdown: -0.20      # Trigger L2: Auto close all positions
+  alert_drawdown: -0.10             # Trigger L1: Alert only
+  suspend_drawdown: -0.30           # Trigger L3: Suspend all trading
+
+  # Leverage limits
+  max_leverage: 35                  # Absolute maximum leverage
+
+  # BTC black swan detection
+  btc_crash_threshold: -0.10        # -10% in 24h → reduce 30%
+  btc_black_swan: -0.15             # -15% in 24h → reduce 30-50%
+  btc_reduce_ratio: 0.30            # Reduce position by 30%
+  btc_reduce_ratio_swan: 0.50       # Reduce position by 50% (max)
+
+  # Take profit triggers
+  profit_lock_threshold: 0.50       # Lock profits when +50%
+  profit_lock_ratio: 0.50           # Lock 50% of position
+
+# Monitoring Configuration
+monitor:
+  interval_seconds: 60              # Risk check frequency
+  price_stream_reconnect: true      # Auto-reconnect WebSocket
+  stream_symbols: ["BTCUSDT", "ETHUSDT"]  # Symbols to stream
+
+# Trading Configuration
+trading:
+  dry_run: false                    # Overridable by --dry-run flag
+  default_stop_loss_pct: 0.05       # 5% default stop loss
+  default_take_profit_pct: 0.15     # 15% default take profit
+
+  # Position sizing
+  max_position_size_pct: 0.05       # Max 5% of account per position
+  event_driven_max_pct: 0.05        # Event-driven trades max 5%
+
+# Binance API Configuration (from .env)
+binance:
+  # Endpoints
+  futures_testnet: false
+  spot_testnet: false
+
+  # These are loaded from .env:
+  # - api_key
+  # - api_secret
+
+# Claude AI Configuration (from .env)
+claude:
+  # Model to use
+  model: "claude-sonnet-4-6"
+
+  # Cache configuration
+  cache_enabled: true
+  cache_ttl_seconds: 300            # 5 minutes
+
+  # Max tokens
+  max_tokens: 2000
+
+  # These are loaded from .env:
+  # - api_key
+
+# Logging Configuration
+logging:
+  level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
+  sqlite_db: "data/trades.db"       # SQLite log database
+  console_format: "rich"            # rich, json, default
+
+  # Rotation
+  max_log_size_mb: 100
+  keep_logs_days: 30
+
+# Exchange Configuration
+exchange:
+  # Binance futures (USDT-M)
+  futures_symbol_template: "BUSDUSDT"  # Template for contract symbols
+
+  # Trading pairs to monitor
+  pairs:
+    - "BTCUSDT"
+    - "ETHUSDT"
