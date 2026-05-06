@@ -32,25 +32,50 @@ class OrderManager:
         """Initialize with a BinanceClient instance."""
         self.client = binance_client
 
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_position_side(params: dict, reduce_only: bool, position_side: Optional[str]) -> None:
+        """Mutate params in-place with correct close/position-side field.
+
+        Binance rule:
+        - One-Way Mode (position_side is None): use reduceOnly for close orders.
+        - Hedge Mode (position_side="LONG"|"SHORT"): use positionSide, never reduceOnly.
+          Binance rejects the combination of positionSide + reduceOnly.
+        """
+        if position_side:
+            params["positionSide"] = position_side
+        elif reduce_only:
+            params["reduceOnly"] = "true"
+
+    # ------------------------------------------------------------------
+    # Order placement
+    # ------------------------------------------------------------------
+
     def place_market_order(
         self,
         symbol: str,
         side: str,
         quantity: float,
         reduce_only: bool = False,
+        position_side: Optional[str] = None,   # fix 3: hedge mode support
         dry_run: Optional[bool] = None,
     ) -> Optional[dict]:
-        """Place a futures market order; prints preview and returns None in dry_run."""
+        """Place a futures market order; returns None in dry_run."""
         dry_run = dry_run if dry_run is not None else self.client.dry_run
 
         if dry_run:
-            console.print(f"[yellow][DRY_RUN] Market order: {side} {quantity} {symbol} (reduce_only={reduce_only})[/yellow]")
+            console.print(
+                f"[yellow][DRY_RUN] Market order: {side} {quantity} {symbol} "
+                f"(reduce_only={reduce_only}, position_side={position_side})[/yellow]"
+            )
             return None
 
         try:
             params: dict = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity}
-            if reduce_only:
-                params["reduceOnly"] = "true"
+            self._apply_position_side(params, reduce_only, position_side)
             return self.client.futures_client.new_order(**params)
         except Exception as e:
             raise RuntimeError(f"Failed to place market order: {e}")
@@ -62,13 +87,17 @@ class OrderManager:
         quantity: float,
         price: float,
         reduce_only: bool = False,
+        position_side: Optional[str] = None,
         dry_run: Optional[bool] = None,
     ) -> Optional[dict]:
-        """Place a futures limit order (GTC); prints preview and returns None in dry_run."""
+        """Place a futures limit order (GTC); returns None in dry_run."""
         dry_run = dry_run if dry_run is not None else self.client.dry_run
 
         if dry_run:
-            console.print(f"[yellow][DRY_RUN] Limit order: {side} {quantity} {symbol} @ {price} (reduce_only={reduce_only})[/yellow]")
+            console.print(
+                f"[yellow][DRY_RUN] Limit order: {side} {quantity} {symbol} @ {price} "
+                f"(reduce_only={reduce_only}, position_side={position_side})[/yellow]"
+            )
             return None
 
         try:
@@ -80,8 +109,7 @@ class OrderManager:
                 "quantity": quantity,
                 "price": price,
             }
-            if reduce_only:
-                params["reduceOnly"] = "true"
+            self._apply_position_side(params, reduce_only, position_side)
             return self.client.futures_client.new_order(**params)
         except Exception as e:
             raise RuntimeError(f"Failed to place limit order: {e}")
@@ -93,13 +121,17 @@ class OrderManager:
         quantity: float,
         stop_price: float,
         reduce_only: bool = True,
+        position_side: Optional[str] = None,   # fix 3
         dry_run: Optional[bool] = None,
     ) -> Optional[dict]:
-        """Place a STOP_MARKET order for stop-loss; returns None in dry_run."""
+        """Place a STOP_MARKET order; returns None in dry_run."""
         dry_run = dry_run if dry_run is not None else self.client.dry_run
 
         if dry_run:
-            console.print(f"[yellow][DRY_RUN] Stop market: {side} {quantity} {symbol} (stop @ {stop_price})[/yellow]")
+            console.print(
+                f"[yellow][DRY_RUN] Stop market: {side} {quantity} {symbol} "
+                f"(stop @ {stop_price}, position_side={position_side})[/yellow]"
+            )
             return None
 
         try:
@@ -110,8 +142,7 @@ class OrderManager:
                 "quantity": quantity,
                 "stopPrice": stop_price,
             }
-            if reduce_only:
-                params["reduceOnly"] = "true"
+            self._apply_position_side(params, reduce_only, position_side)
             return self.client.futures_client.new_order(**params)
         except Exception as e:
             raise RuntimeError(f"Failed to place stop market order: {e}")
@@ -123,13 +154,17 @@ class OrderManager:
         quantity: float,
         stop_price: float,
         reduce_only: bool = True,
+        position_side: Optional[str] = None,   # fix 3
         dry_run: Optional[bool] = None,
     ) -> Optional[dict]:
         """Place a TAKE_PROFIT_MARKET order; returns None in dry_run."""
         dry_run = dry_run if dry_run is not None else self.client.dry_run
 
         if dry_run:
-            console.print(f"[yellow][DRY_RUN] Take profit: {side} {quantity} {symbol} (tp @ {stop_price})[/yellow]")
+            console.print(
+                f"[yellow][DRY_RUN] Take profit: {side} {quantity} {symbol} "
+                f"(tp @ {stop_price}, position_side={position_side})[/yellow]"
+            )
             return None
 
         try:
@@ -140,8 +175,7 @@ class OrderManager:
                 "quantity": quantity,
                 "stopPrice": stop_price,
             }
-            if reduce_only:
-                params["reduceOnly"] = "true"
+            self._apply_position_side(params, reduce_only, position_side)
             return self.client.futures_client.new_order(**params)
         except Exception as e:
             raise RuntimeError(f"Failed to place take profit order: {e}")

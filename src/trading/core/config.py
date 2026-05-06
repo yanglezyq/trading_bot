@@ -43,6 +43,23 @@ class RiskConfig:
     btc_reduce_ratio_swan: float = 0.50
     profit_lock_threshold: float = 0.50
     profit_lock_ratio: float = 0.50
+    high_volatility_24h_pct: float = 8.0
+    extreme_move_24h_pct: float = 12.0
+    max_leverage_high_vol: int = 10
+    max_position_size_high_vol_pct: float = 0.02
+    max_abs_funding_rate: float = 0.0010
+    btc_risk_off_24h_pct: float = -4.0
+    altcoin_max_leverage_when_btc_weak: int = 5
+    altcoin_max_position_size_when_btc_weak_pct: float = 0.015
+    alt_relative_strength_warning_pct: float = -5.0
+    liquid_alt_quote_volume_24h_usdt: float = 250_000_000.0
+    mid_alt_quote_volume_24h_usdt: float = 50_000_000.0
+    high_beta_alt_max_leverage: int = 3
+    high_beta_alt_max_position_size_pct: float = 0.01
+    crowded_oi_to_volume_ratio: float = 0.75
+    btc_rebound_trigger_24h_pct: float = 3.0
+    btc_squeeze_funding_threshold: float = 0.0015
+    thin_liquidity_market_order_notional_usdt: float = 15_000.0
 
 
 @dataclass

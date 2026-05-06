@@ -11,6 +11,7 @@ from rich.table import Table
 
 from .core import AppConfig, TradeJournal, TradingLogger, VaultReader, load_config
 from .exchange import AccountManager, BinanceClient, PositionManager
+from .pipeline import TradePipeline, is_trading_api_configured
 
 app = typer.Typer(
     name="trading",
@@ -325,6 +326,318 @@ def journal(
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def trade(
+    symbol: str = typer.Argument(..., help="Trading symbol, e.g. BTCUSDT"),
+    market: str = typer.Option("auto", "--market", help="Market type: spot | futures | auto"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Use mock account snapshot for analysis preview"),
+    write_vault: bool = typer.Option(True, "--write-vault/--no-write-vault", help="Write Markdown report to Vault"),
+    show_context: bool = typer.Option(False, "--show-context", help="Print Vault context before analysis"),
+    allow_partial: bool = typer.Option(
+        False,
+        "--allow-partial",
+        help="If risk gate adjusts size/leverage, execute at adjusted values instead of blocking",
+    ),
+    config_path: str = typer.Option("config.yaml", "--config"),
+) -> None:
+    """Run the full AI trading pipeline: research → plan → risk → manual order ticket."""
+    try:
+        config = load_app_config(config_path=config_path, dry_run=dry_run)
+
+        # ── API configuration check (display early, pipeline also checks)
+        api_ok = is_trading_api_configured(config)
+        if not dry_run and not api_ok:
+            console.print(
+                "[yellow]⚠ 未配置交易api，无法执行交易。"
+                "分析将正常进行，执行阶段会显示明确提示。[/yellow]"
+            )
+
+        if show_context:
+            try:
+                vault = VaultReader(config.vault)
+                ctx = vault.build_knowledge_context([symbol.upper()])
+                console.print(Panel(ctx[:3000], title="Vault Context Preview"))
+            except Exception as exc:
+                console.print(f"[yellow]Vault context unavailable: {exc}[/yellow]")
+
+        mode_label = "[yellow][DRY RUN][/yellow]" if dry_run else "[cyan][MANUAL REVIEW][/cyan]"
+        console.print(
+            Panel(
+                f"Symbol: [bold cyan]{symbol.upper()}[/bold cyan]  "
+                f"Market: {market}  Mode: {mode_label}  "
+                f"API: {'✓' if api_ok else '✗ not configured'}",
+                title="Trading Pipeline",
+            )
+        )
+
+        pipeline = TradePipeline(config=config, dry_run=dry_run)
+        research, plan, risk, result = pipeline.run(
+            symbol=symbol,
+            market=market,
+            write_vault=write_vault,
+            allow_partial=allow_partial,
+        )
+        market_snapshot = pipeline.last_market_snapshot
+
+        # ── Rich output ──────────────────────────────────────────────
+
+        # Market Snapshot
+        market_table = Table(title="Market Snapshot", show_header=True, header_style="bold blue")
+        market_table.add_column("Field", style="cyan", min_width=18)
+        market_table.add_column("Value")
+        for label, key in [
+            ("Spot Price", "spot_price"),
+            ("Futures Mark", "futures_mark_price"),
+            ("24h Move", "price_change_24h_pct"),
+            ("7d Move", "price_change_7d_pct"),
+            ("24h Volume", "quote_volume_24h_usdt"),
+            ("Funding", "funding_rate"),
+            ("Open Interest", "open_interest"),
+            ("OI/Vol Ratio", "oi_to_volume_ratio"),
+            ("Basis (bps)", "basis_bps"),
+            ("EMA21 1h", "ema_21_1h"),
+            ("EMA55 1h", "ema_55_1h"),
+            ("EMA144 1h", "ema_144_1h"),
+            ("Dist to EMA21", "distance_to_ema21_pct"),
+            ("Dist to EMA55", "distance_to_ema55_pct"),
+            ("Dist to 7d High", "distance_to_7d_high_pct"),
+            ("Dist to 7d Low", "distance_to_7d_low_pct"),
+            ("Hourly Trend", "hourly_trend_bias"),
+            ("Asset Tier", "asset_tier"),
+            ("Liquidity", "liquidity_regime"),
+            ("Crowding", "crowding_regime"),
+            ("24h Realized Vol", "realized_vol_24h_pct"),
+            ("7d Realized Vol", "realized_vol_7d_pct"),
+            ("Vol Regime", "volatility_regime"),
+            ("Momentum", "momentum_regime"),
+            ("BTC Regime", "btc_market_regime"),
+            ("RS vs BTC 24h", "relative_strength_24h_pct"),
+            ("RS vs BTC 7d", "relative_strength_7d_pct"),
+            ("Exec Template", "execution_template"),
+        ]:
+            if key in market_snapshot:
+                value = market_snapshot[key]
+                suffix = "%" if "Move" in label or "Vol" in label else ""
+                market_table.add_row(label, f"{value}{suffix}" if isinstance(value, (int, float)) else str(value))
+        console.print(market_table)
+
+        # ResearchDecision
+        r_color = {"long": "green", "short": "red", "neutral": "yellow"}.get(research.stance, "white")
+        research_table = Table(title="ResearchDecision", show_header=True, header_style="bold cyan")
+        research_table.add_column("Field", style="cyan", min_width=18)
+        research_table.add_column("Value")
+        research_table.add_row("Symbol", research.symbol)
+        research_table.add_row("Stance", f"[{r_color}]{research.stance.upper()}[/{r_color}]")
+        research_table.add_row("Confidence", f"{research.confidence:.1%}")
+        research_table.add_row("Thesis", research.thesis[:120])
+        research_table.add_row("Market Structure", research.market_structure[:120])
+        if research.evidence:
+            research_table.add_row("Evidence", "\n".join(f"• {e}" for e in research.evidence[:5]))
+        research_table.add_row("Catalysts", "\n".join(f"• {c}" for c in research.catalysts[:5]))
+        research_table.add_row("Risks", "\n".join(f"• {r}" for r in research.risks[:5]))
+        research_table.add_row("Invalidation", research.invalidation[:100])
+        research_table.add_row("Time Horizon", research.time_horizon[:80])
+        research_table.add_row("Market", research.preferred_market)
+        console.print(research_table)
+
+        # ExecutionPlan
+        plan_table = Table(title="ExecutionPlan", show_header=True, header_style="bold magenta")
+        plan_table.add_column("Field", style="cyan", min_width=18)
+        plan_table.add_column("Value")
+        plan_table.add_row("Action", f"[bold]{plan.action}[/bold]")
+        plan_table.add_row("Size", f"{plan.size_pct:.1f}% of account")
+        plan_table.add_row("Leverage", f"{plan.leverage}x")
+        plan_table.add_row("Entry Idea", plan.entry_idea[:120])
+        if plan.entry_style:
+            plan_table.add_row("Entry Style", plan.entry_style)
+        if plan.entry_zone_low is not None or plan.entry_zone_high is not None:
+            plan_table.add_row("Entry Zone", f"{plan.entry_zone_low} - {plan.entry_zone_high}")
+        if plan.trigger_price is not None:
+            plan_table.add_row("Trigger Price", str(plan.trigger_price))
+        if plan.invalidation_price is not None:
+            plan_table.add_row("Invalidation Price", str(plan.invalidation_price))
+        plan_table.add_row("Stop Loss", f"{plan.stop_loss_pct:.1f}%")
+        plan_table.add_row("Take Profit", f"{plan.take_profit_pct:.1f}%")
+        if plan.thesis_window_hours is not None:
+            plan_table.add_row("Thesis Window", f"{plan.thesis_window_hours}h")
+        plan_table.add_row("Rationale", plan.rationale[:120])
+        console.print(plan_table)
+
+        # RiskDecision
+        risk_color = "green" if risk.approved else "red"
+        risk_label = "✅ APPROVED" if risk.approved else "❌ REJECTED"
+        risk_table = Table(title="RiskDecision", show_header=True, header_style="bold yellow")
+        risk_table.add_column("Field", style="cyan", min_width=18)
+        risk_table.add_column("Value")
+        risk_table.add_row("Decision", f"[{risk_color}]{risk_label}[/{risk_color}]")
+        if risk.violated_rules:
+            risk_table.add_row(
+                "Violated Rules", "\n".join(f"• {v}" for v in risk.violated_rules)
+            )
+        if risk.warnings:
+            risk_table.add_row("Warnings", "\n".join(f"• {w}" for w in risk.warnings))
+        risk_table.add_row("Adj. Action", str(risk.adjusted_action))
+        risk_table.add_row("Adj. Size", f"{risk.adjusted_size_pct:.1f}%")
+        risk_table.add_row("Adj. Leverage", f"{risk.adjusted_leverage}x" if risk.adjusted_leverage else "N/A")
+        risk_table.add_row("Rationale", risk.rationale[:160])
+        console.print(risk_table)
+
+        # ExecutionResult
+        status_colors = {
+            "executed": "green",
+            "dry_run": "yellow",
+            "manual_review_required": "cyan",
+            "blocked_by_risk": "red",
+            "not_executed_missing_api": "red",
+            "execution_failed": "red",
+            "hold": "yellow",
+        }
+        sc = status_colors.get(result.status, "white")
+        result_table = Table(title="ExecutionResult", show_header=True, header_style="bold green")
+        result_table.add_column("Field", style="cyan", min_width=18)
+        result_table.add_column("Value")
+        result_table.add_row("Status", f"[{sc}]{result.status}[/{sc}]")
+        result_table.add_row("Executed", "Yes" if result.executed else "No")
+        result_table.add_row("Final Action", result.final_action)
+        result_table.add_row("Final Size", f"{result.final_size_pct:.1f}%")
+        if result.final_leverage:
+            result_table.add_row("Final Leverage", f"{result.final_leverage}x")
+        result_table.add_row("Exchange", result.exchange or "—")
+        result_table.add_row("Message", result.message)
+        if result.order_ids:
+            result_table.add_row("Order IDs", ", ".join(result.order_ids))
+        if result.execution_reason:
+            result_table.add_row("Why", result.execution_reason[:240])
+        console.print(result_table)
+
+        if result.manual_order_details:
+            manual_table = Table(title="Manual Order Ticket", show_header=True, header_style="bold blue")
+            manual_table.add_column("Field", style="cyan", min_width=18)
+            manual_table.add_column("Value")
+            for key, value in result.manual_order_details.items():
+                manual_table.add_row(key, str(value))
+            console.print(manual_table)
+
+        # Final banner
+        if result.status == "not_executed_missing_api":
+            console.print(
+                Panel(
+                    "[bold red]未配置交易api[/bold red]\n"
+                    "请在 .env 设置 BINANCE_API_KEY / BINANCE_API_SECRET",
+                    border_style="red",
+                )
+            )
+        elif result.status == "dry_run":
+            console.print(
+                Panel("[yellow]分析预览完成 — 已输出手动下单草案，未自动下单[/yellow]", border_style="yellow")
+            )
+        elif result.status == "manual_review_required":
+            console.print(
+                Panel(
+                    "[cyan]已生成手动下单明细，请你人工确认后自行下单[/cyan]",
+                    border_style="cyan",
+                )
+            )
+        elif result.status == "blocked_by_risk":
+            console.print(
+                Panel(
+                    f"[red]✗ 风控拒绝 — {risk.rationale[:200]}[/red]",
+                    border_style="red",
+                )
+            )
+        elif result.status == "hold":
+            console.print(
+                Panel("[yellow]AI 最终建议 HOLD，本次无需下单[/yellow]", border_style="yellow")
+            )
+
+    except Exception as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def reflect(
+    symbol: Optional[str] = typer.Option(None, "--symbol", help="Symbol to reflect on (all if omitted)"),
+    limit: int = typer.Option(10, "--limit", help="Max past trades to analyse"),
+    config_path: str = typer.Option("config.yaml", "--config"),
+) -> None:
+    """Generate AI reflection from past closed trades; saved for future pipeline runs."""
+    try:
+        config = load_app_config(config_path=config_path)
+
+        if not config.claude.api_key:
+            console.print("[red]Anthropic API key not configured (ANTHROPIC_API_KEY).[/red]")
+            raise typer.Exit(1)
+
+        from .ai.advisor import TradingAdvisor
+        from .ai.client import ClaudeClient
+        from .pipeline.persistence import TradeRunDB
+
+        journal = TradeJournal(config.logging.sqlite_db)
+        db = TradeRunDB(config.logging.sqlite_db)
+        claude = ClaudeClient(config.claude)
+        advisor = TradingAdvisor(claude, config)
+
+        trades = journal.get_trades(symbol=symbol, limit=limit)
+        if not trades:
+            target = symbol.upper() if symbol else "all symbols"
+            console.print(f"[yellow]No closed trades found for {target}. Record some trades first.[/yellow]")
+            return
+
+        trade_sym = symbol.upper() if symbol else (trades[0].symbol if trades else "UNKNOWN")
+        trade_dicts = [
+            {
+                "symbol": t.symbol,
+                "direction": t.direction,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "realized_pnl": t.realized_pnl,
+                "pnl_pct": t.pnl_pct,
+                "open_time": t.open_time.isoformat(),
+                "close_time": t.close_time.isoformat(),
+                "notes": t.notes,
+            }
+            for t in trades
+        ]
+
+        console.print(f"[cyan]Generating reflection from {len(trades)} trade(s) for {trade_sym}…[/cyan]")
+        reflection = advisor.generate_reflection(symbol=trade_sym, trades=trade_dicts)
+
+        trade_ids = [t.id for t in trades if t.id is not None]
+        ref_id = db.save_reflection(
+            symbol=trade_sym,
+            model=config.claude.model,
+            trades_analyzed=len(trades),
+            reflection_data=reflection,
+            source_trade_ids=trade_ids,
+        )
+
+        # Display
+        ref_table = Table(title=f"Reflection — {trade_sym}", show_header=True, header_style="bold cyan")
+        ref_table.add_column("Field", style="cyan", min_width=22)
+        ref_table.add_column("Value")
+        ref_table.add_row("Trades Analysed", str(len(trades)))
+        ref_table.add_row("Direction Accuracy", reflection.get("direction_accuracy", "—")[:160])
+        ref_table.add_row("Thesis Evaluation", reflection.get("thesis_evaluation", "—")[:160])
+        lessons = reflection.get("lessons", [])
+        if lessons:
+            ref_table.add_row("Lessons", "\n".join(f"• {l}" for l in lessons[:5]))
+        ref_table.add_row("Saved As ID", str(ref_id))
+        console.print(ref_table)
+
+        if reflection.get("reflection_text"):
+            console.print(Panel(reflection["reflection_text"][:1200], title="Full Reflection"))
+
+        console.print(
+            f"[green]✓ Reflection saved (id={ref_id}). "
+            "It will be injected into the next [bold]trading trade[/bold] run.[/green]"
+        )
+
+    except Exception as exc:
+        console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
 
 
