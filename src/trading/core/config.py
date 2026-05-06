@@ -60,6 +60,18 @@ class RiskConfig:
     btc_rebound_trigger_24h_pct: float = 3.0
     btc_squeeze_funding_threshold: float = 0.0015
     thin_liquidity_market_order_notional_usdt: float = 15_000.0
+    meme_max_leverage: int = 2
+    meme_max_position_size_pct: float = 0.0075
+    narrative_thesis_window_cap_hours: int = 24
+    portfolio_soft_gross_exposure_pct: float = 80.0
+    portfolio_hard_gross_exposure_pct: float = 120.0
+    portfolio_max_positions: int = 8
+    max_positions_per_narrative: int = 2
+    same_symbol_addition_scale: float = 0.5
+    core_position_cap_pct: float = 0.06
+    major_alt_position_cap_pct: float = 0.04
+    liquid_alt_position_cap_pct: float = 0.03
+    mid_alt_position_cap_pct: float = 0.02
 
 
 @dataclass

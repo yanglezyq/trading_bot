@@ -2,6 +2,7 @@
 
 from ..ai.schemas import ExecutionPlan, RiskDecision
 from ..core.config import AppConfig
+from ..exchange.market_data import infer_narrative_tag
 
 _CLOSE_ACTIONS = frozenset({"close_long", "close_short", "sell_spot", "hold"})
 _OPEN_ACTIONS = frozenset({"open_long", "open_short", "buy_spot"})
@@ -19,6 +20,8 @@ class RiskGate:
         account_snapshot: dict,
         positions: list[dict],
         market_snapshot: dict | None = None,
+        portfolio_snapshot: dict | None = None,
+        portfolio_budget: dict | None = None,
     ) -> RiskDecision:
         """Return a RiskDecision after applying all configured risk rules."""
         violated_rules: list[str] = []
@@ -37,6 +40,20 @@ class RiskGate:
                 f"size_pct {plan.size_pct:.1f}% exceeds max_position_size_pct {max_size:.1f}%"
             )
             adjusted_size_pct = max_size
+
+        if portfolio_budget and plan.action in _OPEN_ACTIONS:
+            recommended_cap = float(portfolio_budget.get("recommended_max_size_pct", adjusted_size_pct) or adjusted_size_pct)
+            hard_cap = float(portfolio_budget.get("hard_cap_size_pct", recommended_cap) or recommended_cap)
+            if plan.size_pct > hard_cap:
+                violated_rules.append(
+                    f"size_pct {plan.size_pct:.1f}% exceeds portfolio hard cap {hard_cap:.1f}%"
+                )
+                adjusted_size_pct = min(adjusted_size_pct, hard_cap)
+            elif adjusted_size_pct > recommended_cap:
+                warnings.append(
+                    f"Portfolio budget recommends max {recommended_cap:.1f}% for this setup."
+                )
+                adjusted_size_pct = min(adjusted_size_pct, recommended_cap)
 
         # Rule 2: event_driven_max_pct warning
         event_max = self.config.trading.event_driven_max_pct * 100
@@ -79,6 +96,15 @@ class RiskGate:
                 f"Drawdown {drawdown:.1f}% exceeds alert threshold {alert_pct:.1f}%"
             )
 
+        if portfolio_snapshot and plan.action in _OPEN_ACTIONS:
+            gross_exposure = float(portfolio_snapshot.get("gross_exposure_pct", 0.0) or 0.0)
+            if gross_exposure >= self.config.risk.portfolio_hard_gross_exposure_pct:
+                violated_rules.append(
+                    f"Gross exposure {gross_exposure:.1f}% already exceeds hard portfolio cap."
+                )
+                adjusted_action = "hold"
+                adjusted_size_pct = 0.0
+
         # Rule 5: missing stop loss → add default
         if stop_loss_pct <= 0 and plan.action not in ("hold", "close_long", "close_short"):
             default_sl = self.config.trading.default_stop_loss_pct * 100
@@ -116,6 +142,19 @@ class RiskGate:
                         "ensure this is intentional"
                     )
 
+        same_narrative_count = 0
+        if market_snapshot and plan.action in _OPEN_ACTIONS:
+            narrative_tag = str(market_snapshot.get("narrative_tag", "general_alt"))
+            same_narrative_count = sum(
+                1 for p in positions
+                if infer_narrative_tag(str(p.get("symbol", ""))) == narrative_tag
+            )
+            if same_narrative_count >= 2 and narrative_tag not in {"store_of_value", "smart_contract_l1"}:
+                warnings.append(
+                    f"Portfolio already has {same_narrative_count} position(s) in narrative '{narrative_tag}' — concentration risk is rising."
+                )
+                adjusted_size_pct = min(adjusted_size_pct, 1.5)
+
         # Rule 8b: price-geometry sanity checks for crypto execution plans
         if plan.action in _OPEN_ACTIONS:
             if (
@@ -140,8 +179,10 @@ class RiskGate:
             rel_strength_7d = float(market_snapshot.get("relative_strength_7d_pct", 0.0) or 0.0)
             btc_regime = str(market_snapshot.get("btc_market_regime", "mixed"))
             asset_tier = str(market_snapshot.get("asset_tier", "liquid_alt"))
+            narrative_tag = str(market_snapshot.get("narrative_tag", "general_alt"))
             crowding_regime = str(market_snapshot.get("crowding_regime", "balanced"))
             oi_to_volume_ratio = float(market_snapshot.get("oi_to_volume_ratio", 0.0) or 0.0)
+            execution_template = str(market_snapshot.get("execution_template", "generic_manual_review"))
 
             high_vol = float(self.config.risk.high_volatility_24h_pct)
             max_lev_high_vol = int(self.config.risk.max_leverage_high_vol)
@@ -193,6 +234,22 @@ class RiskGate:
                 warnings.append(
                     "Symbol classified as high_beta_alt — applying tighter leverage and size caps."
                 )
+
+            if narrative_tag == "meme":
+                adjusted_leverage = min(adjusted_leverage, self.config.risk.meme_max_leverage)
+                adjusted_size_pct = min(
+                    adjusted_size_pct,
+                    self.config.risk.meme_max_position_size_pct * 100,
+                )
+                warnings.append(
+                    "Meme narrative detected — enforce ultra-light size and leverage, and expect slippage/volatility spikes."
+                )
+                if btc_regime in {"panic_flush", "risk_off_trend", "risk_off"}:
+                    warnings.append(
+                        "Meme narrative under BTC risk-off regime — default to no-trade unless setup is exceptionally strong."
+                    )
+                    adjusted_action = "hold"
+                    adjusted_size_pct = 0.0
 
             if plan.action == "open_long" and trend_bias == "bearish":
                 warnings.append(
@@ -251,6 +308,43 @@ class RiskGate:
                     warnings.append(
                         f"Current spot price is {drift_pct:.1f}% away from the proposed entry zone midpoint — execution may need refresh."
                     )
+
+            # Template-specific overlays
+            if execution_template == "core_reclaim_wait":
+                if plan.trigger_price is None:
+                    warnings.append("core_reclaim_wait requires a trigger_price for reclaim confirmation.")
+                if plan.thesis_window_hours and plan.thesis_window_hours > 48:
+                    warnings.append("core_reclaim_wait thesis window is too long; reclaim setups should resolve quickly.")
+
+            elif execution_template == "alt_follow_with_confirmation":
+                if plan.trigger_price is None:
+                    warnings.append("alt_follow_with_confirmation should define trigger_price before entry.")
+                if rel_strength_7d < 0:
+                    warnings.append("alt_follow_with_confirmation but relative strength vs BTC is negative — confirmation quality is weak.")
+
+            elif execution_template == "alt_defensive_only":
+                adjusted_leverage = min(adjusted_leverage, 3)
+                adjusted_size_pct = min(adjusted_size_pct, 1.5)
+                if plan.entry_style == "market_now":
+                    warnings.append("alt_defensive_only should avoid immediate market chasing; prefer passive or staged entries.")
+
+            elif execution_template == "mid_alt_staged_entry":
+                if plan.entry_zone_low is None or plan.entry_zone_high is None:
+                    warnings.append("mid_alt_staged_entry should define a concrete entry zone for staged execution.")
+                adjusted_size_pct = min(adjusted_size_pct, 2.0)
+
+            elif execution_template == "high_beta_confirmation_only":
+                if plan.trigger_price is None:
+                    warnings.append("high_beta_confirmation_only requires trigger_price before any entry.")
+                if plan.thesis_window_hours and plan.thesis_window_hours > self.config.risk.narrative_thesis_window_cap_hours:
+                    warnings.append("high_beta_confirmation_only should keep thesis_window_hours short.")
+                adjusted_size_pct = min(adjusted_size_pct, self.config.risk.high_beta_alt_max_position_size_pct * 100)
+                adjusted_leverage = min(adjusted_leverage, self.config.risk.high_beta_alt_max_leverage)
+
+            if narrative_tag in {"ai_agent", "ai_compute"} and btc_regime in {"risk_on_trend", "short_squeeze"}:
+                warnings.append(
+                    "AI-related narrative aligns with a positive BTC tape — momentum can persist, but watch crowding closely."
+                )
 
         approved = len(violated_rules) == 0
 

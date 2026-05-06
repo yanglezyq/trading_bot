@@ -12,6 +12,36 @@ from ..core.config import AppConfig, BinanceConfig
 from .um_futures import UMFutures
 
 
+_NARRATIVE_MAP = {
+    "BTCUSDT": "store_of_value",
+    "ETHUSDT": "smart_contract_l1",
+    "SOLUSDT": "high_beta_l1",
+    "BNBUSDT": "exchange_ecosystem",
+    "XRPUSDT": "payments",
+    "ADAUSDT": "layer1",
+    "DOGEUSDT": "meme",
+    "SHIBUSDT": "meme",
+    "PEPEUSDT": "meme",
+    "BONKUSDT": "meme",
+    "WIFUSDT": "meme",
+    "LINKUSDT": "oracle",
+    "AAVEUSDT": "defi",
+    "UNIUSDT": "defi",
+    "MKRUSDT": "defi",
+    "ARBUSDT": "layer2",
+    "OPUSDT": "layer2",
+    "STRKUSDT": "layer2",
+    "RENDERUSDT": "ai_compute",
+    "FETUSDT": "ai_agent",
+    "TAOUSDT": "ai_agent",
+}
+
+
+def infer_narrative_tag(symbol: str) -> str:
+    """Infer a coarse crypto narrative tag from the trading symbol."""
+    return _NARRATIVE_MAP.get(symbol.upper(), "general_alt")
+
+
 @dataclass
 class MarketSnapshot:
     """Compact market snapshot for one crypto symbol."""
@@ -40,6 +70,7 @@ class MarketSnapshot:
     distance_to_7d_low_pct: float
     hourly_trend_bias: str
     asset_tier: str
+    narrative_tag: str
     liquidity_regime: str
     crowding_regime: str
     volatility_regime: str
@@ -176,6 +207,7 @@ class MarketDataManager:
             distance_to_7d_low_pct=distance_to_7d_low_pct,
             hourly_trend_bias=self._hourly_trend_bias(futures_mark_price, ema_21, ema_55, ema_144),
             asset_tier=self._asset_tier(symbol, quote_volume_24h_usdt),
+            narrative_tag=self._narrative_tag(symbol),
             liquidity_regime=self._liquidity_regime(quote_volume_24h_usdt),
             crowding_regime=self._crowding_regime(
                 funding_rate=funding_rate,
@@ -251,6 +283,10 @@ class MarketDataManager:
         if quote_volume_24h_usdt >= self._cfg("mid_alt_quote_volume_24h_usdt", 50_000_000.0):
             return "mid_alt"
         return "high_beta_alt"
+
+    @staticmethod
+    def _narrative_tag(symbol: str) -> str:
+        return infer_narrative_tag(symbol)
 
     @staticmethod
     def _liquidity_regime(quote_volume_24h_usdt: float) -> str:
@@ -376,6 +412,7 @@ class MarketDataManager:
             distance_to_7d_low_pct=8.5,
             hourly_trend_bias="bullish",
             asset_tier="core" if symbol == "BTCUSDT" else "liquid_alt",
+            narrative_tag=MarketDataManager._narrative_tag(symbol),
             liquidity_regime="liquid",
             crowding_regime="balanced",
             volatility_regime="normal",

@@ -131,11 +131,14 @@ def sync(
     try:
         config = load_app_config(config_path=config_path, dry_run=dry_run)
         logger = TradingLogger("trading.sync", config.logging)
-        binance = BinanceClient(config.binance, dry_run=False)
+        binance = BinanceClient(config.binance, dry_run=dry_run)
         positions_mgr = PositionManager(binance)
         vault = VaultReader(config.vault)
 
-        console.print("[cyan]Fetching positions from Binance...[/cyan]")
+        if dry_run:
+            console.print("[cyan]Loading mock positions for preview...[/cyan]")
+        else:
+            console.print("[cyan]Fetching live positions from Binance...[/cyan]")
         futures_pos = positions_mgr.get_futures_positions()
         spot_holdings = positions_mgr.get_spot_holdings()
 
@@ -221,7 +224,7 @@ def status(
         table.add_row("Binance API", binance_status)
         table.add_row(
             "Claude API",
-            "Configured" if config.claude.api_key else "Not configured (Phase 2)",
+            "Configured" if config.claude.api_key else "Not configured (required for AI trade analysis)",
         )
 
         console.print(table)
@@ -339,7 +342,7 @@ def trade(
     allow_partial: bool = typer.Option(
         False,
         "--allow-partial",
-        help="If risk gate adjusts size/leverage, execute at adjusted values instead of blocking",
+        help="If risk gate adjusts size/leverage, generate the manual order ticket using adjusted values instead of blocking",
     ),
     config_path: str = typer.Option("config.yaml", "--config"),
 ) -> None:
@@ -381,6 +384,8 @@ def trade(
             allow_partial=allow_partial,
         )
         market_snapshot = pipeline.last_market_snapshot
+        portfolio_snapshot = pipeline.last_portfolio_snapshot
+        portfolio_budget = pipeline.last_portfolio_budget
 
         # ── Rich output ──────────────────────────────────────────────
 
@@ -407,6 +412,7 @@ def trade(
             ("Dist to 7d Low", "distance_to_7d_low_pct"),
             ("Hourly Trend", "hourly_trend_bias"),
             ("Asset Tier", "asset_tier"),
+            ("Narrative", "narrative_tag"),
             ("Liquidity", "liquidity_regime"),
             ("Crowding", "crowding_regime"),
             ("24h Realized Vol", "realized_vol_24h_pct"),
@@ -423,6 +429,25 @@ def trade(
                 suffix = "%" if "Move" in label or "Vol" in label else ""
                 market_table.add_row(label, f"{value}{suffix}" if isinstance(value, (int, float)) else str(value))
         console.print(market_table)
+
+        portfolio_table = Table(title="Portfolio Overlay", show_header=True, header_style="bold white")
+        portfolio_table.add_column("Field", style="cyan", min_width=18)
+        portfolio_table.add_column("Value")
+        for label, value in [
+            ("Total Balance", f"${portfolio_snapshot.get('total_balance_usdt', 0):,.2f}"),
+            ("Gross Exposure", f"{portfolio_snapshot.get('gross_exposure_pct', 0):.1f}%"),
+            ("Net Exposure", f"{portfolio_snapshot.get('net_exposure_pct', 0):.1f}%"),
+            ("Position Count", str(portfolio_snapshot.get("position_count", 0))),
+            ("Portfolio Role", str(portfolio_budget.get("portfolio_role", "N/A"))),
+            ("Narrative", str(portfolio_budget.get("narrative_tag", "N/A"))),
+            ("Recommended Max Size", f"{portfolio_budget.get('recommended_max_size_pct', 'N/A')}%"),
+            ("Tier Hard Cap", f"{portfolio_budget.get('hard_cap_size_pct', 'N/A')}%"),
+        ]:
+            portfolio_table.add_row(label, value)
+        if portfolio_budget.get("warnings"):
+            portfolio_table.add_row("Budget Warnings", "\n".join(f"• {w}" for w in portfolio_budget["warnings"]))
+        portfolio_table.add_row("Rationale", str(portfolio_budget.get("rationale", ""))[:220])
+        console.print(portfolio_table)
 
         # ResearchDecision
         r_color = {"long": "green", "short": "red", "neutral": "yellow"}.get(research.stance, "white")

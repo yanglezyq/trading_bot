@@ -18,6 +18,7 @@ from ..exchange.market_data import MarketDataManager
 from ..exchange.orders import OrderManager
 from ..exchange.positions import PositionManager
 from ..risk.gate import RiskGate
+from ..risk.portfolio import PortfolioManager
 from .persistence import TradeRunDB
 
 console = Console()
@@ -68,7 +69,10 @@ class TradePipeline:
         self.claude = ClaudeClient(config.claude)
         self.advisor = TradingAdvisor(self.claude, config)
         self.risk_gate = RiskGate(config)
+        self.portfolio_manager = PortfolioManager(config)
         self.last_market_snapshot: dict = {}
+        self.last_portfolio_snapshot: dict = {}
+        self.last_portfolio_budget: dict = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -92,6 +96,15 @@ class TradePipeline:
         symbol_positions = [p for p in all_positions if p.get("symbol", "").upper() == symbol]
         market_snapshot = self._get_market_snapshot(symbol)
         self.last_market_snapshot = market_snapshot
+        portfolio_snapshot = self.portfolio_manager.build_snapshot(account_summary, all_positions).to_dict()
+        portfolio_budget = self.portfolio_manager.recommend_budget(
+            symbol=symbol,
+            market_snapshot=market_snapshot,
+            positions=all_positions,
+            account_summary=account_summary,
+        ).to_dict()
+        self.last_portfolio_snapshot = portfolio_snapshot
+        self.last_portfolio_budget = portfolio_budget
 
         vault_context = self._get_vault_context(symbol)
         trade_history = self._get_trade_history(symbol)
@@ -127,8 +140,10 @@ class TradePipeline:
         risk = self.risk_gate.evaluate(
             plan=plan,
             account_snapshot=account_summary,
-            positions=symbol_positions,
+            positions=all_positions,
             market_snapshot=market_snapshot,
+            portfolio_snapshot=portfolio_snapshot,
+            portfolio_budget=portfolio_budget,
         )
 
         console.print("[cyan]Step 10–11  Executing action…[/cyan]")
@@ -156,6 +171,8 @@ class TradePipeline:
                 risk=risk,
                 result=result,
                 reflections=reflections,
+                portfolio_snapshot=portfolio_snapshot,
+                portfolio_budget=portfolio_budget,
             )
 
         console.print("[cyan]Step 12  Persisting run to SQLite…[/cyan]")
@@ -594,6 +611,7 @@ class TradePipeline:
             "execution_template": self.last_market_snapshot.get("execution_template"),
             "btc_market_regime": self.last_market_snapshot.get("btc_market_regime"),
             "asset_tier": self.last_market_snapshot.get("asset_tier"),
+            "narrative_tag": self.last_market_snapshot.get("narrative_tag"),
             "stop_loss_price": stop_loss_price,
             "take_profit_price": take_profit_price,
             "entry_idea": plan.entry_idea,
@@ -607,6 +625,7 @@ class TradePipeline:
         template = ticket.get("execution_template") or "generic_manual_review"
         btc_regime = ticket.get("btc_market_regime") or "range"
         asset_tier = ticket.get("asset_tier") or "unknown"
+        narrative_tag = ticket.get("narrative_tag") or "general_alt"
         notional = float(ticket.get("notional_usdt", 0.0) or 0.0)
 
         rules = {
@@ -616,6 +635,9 @@ class TradePipeline:
             "confirmation_checklist": "",
             "cancel_if": "",
             "template_risk_note": "",
+            "operator_steps": "",
+            "post_fill_protocol": "",
+            "review_after_hours": "",
         }
 
         if template == "core_trend_follow":
@@ -628,6 +650,9 @@ class TradePipeline:
                 ),
                 cancel_if="1h 重新跌回 EMA21 下方且量价转弱。",
                 template_risk_note="核心币趋势单，可接受更主动执行，但仍避免在 24h 极端拉升后追高。",
+                operator_steps="1. 先确认 BTC 仍在趋势中 2. 先下 40% 观察仓 3. 只有趋势确认后再补仓",
+                post_fill_protocol="若 1h 收盘跌回 EMA21 下方，暂停加仓并重新评估。",
+                review_after_hours="12h",
             )
         elif template == "core_reclaim_wait":
             rules.update(
@@ -637,6 +662,9 @@ class TradePipeline:
                 confirmation_checklist="等待 BTC 从 panic_flush/rebound 中完成 reclaim，确认收回关键均线或触发价。",
                 cancel_if="reclaim 失败或反弹量能快速衰减。",
                 template_risk_note="核心币反转/收复型交易，不追第一根反弹棒，优先等确认。",
+                operator_steps="1. 等 reclaim 信号 2. 触发后先小仓试单 3. 回踩不破再补",
+                post_fill_protocol="若 reclaim 后 1-2 根 K 线无法站稳，直接取消剩余计划。",
+                review_after_hours="6h",
             )
         elif template == "core_range_trade":
             rules.update(
@@ -646,6 +674,9 @@ class TradePipeline:
                 confirmation_checklist="仅在给定 entry zone 内执行，若已脱离区间则放弃。",
                 cancel_if="价格离开区间并形成新趋势结构。",
                 template_risk_note="区间交易必须严格执行 entry zone 与 invalidation，不做区间中段追单。",
+                operator_steps="1. 只挂区间边缘单 2. 中段不追 3. 触发后马上设置失效价",
+                post_fill_protocol="若区间边缘失守且未快速收回，按 invalidation 退出。",
+                review_after_hours="8h",
             )
         elif template == "alt_follow_with_confirmation":
             rules.update(
@@ -657,6 +688,9 @@ class TradePipeline:
                 ),
                 cancel_if="BTC regime 转 risk_off 或相对 BTC 强度快速走弱。",
                 template_risk_note="主流山寨跟随单，核心在于跟随 BTC 节奏而不是独立猜底。",
+                operator_steps="1. 先看 BTC 方向 2. 只在 trigger 附近动手 3. 突破失败不硬接",
+                post_fill_protocol="若 BTC 先转弱，优先减仓而不是等本币单独走坏。",
+                review_after_hours="8h",
             )
         elif template == "alt_defensive_only":
             rules.update(
@@ -666,6 +700,9 @@ class TradePipeline:
                 confirmation_checklist="只允许轻仓防守型试单，必须有清晰失效价，且 BTC 不继续走弱。",
                 cancel_if="BTC 延续 risk_off 或本币继续跑输 BTC。",
                 template_risk_note="防守模式下的山寨币不应重仓，宁可错过也不硬接。",
+                operator_steps="1. 只挂小额限价单 2. 不抢第一波反弹 3. 只给一次补仓机会",
+                post_fill_protocol="若 BTC 再度转弱，优先先退出来，不做死扛。",
+                review_after_hours="4h",
             )
         elif template == "alt_selective_range":
             rules.update(
@@ -675,6 +712,9 @@ class TradePipeline:
                 confirmation_checklist="只在区间下沿或明确 trigger 附近做，区间中部不交易。",
                 cancel_if="BTC 或本币脱离区间形成趋势突破/跌破。",
                 template_risk_note="选择性山寨区间单，重点是耐心，不抢中间位置。",
+                operator_steps="1. 三档限价 2. 区间中段绝不追 3. 只在边缘做风险收益比",
+                post_fill_protocol="一旦脱离区间，取消未成交剩余订单。",
+                review_after_hours="6h",
             )
         elif template == "mid_alt_staged_entry":
             rules.update(
@@ -684,6 +724,9 @@ class TradePipeline:
                 confirmation_checklist="中等流动性山寨币必须分批；若实际成交偏离 zone，则放弃。",
                 cancel_if="突破失败、成交量萎缩、或 BTC 转弱。",
                 template_risk_note="中等流动性 alt 以价格位置优先，不能用市场单硬追。",
+                operator_steps="1. 只挂被动限价 2. 分批成交 3. 量能不确认不补",
+                post_fill_protocol="若成交量迅速回落，保留观察仓，取消加仓计划。",
+                review_after_hours="6h",
             )
         elif template == "high_beta_confirmation_only":
             rules.update(
@@ -695,6 +738,9 @@ class TradePipeline:
                 ),
                 cancel_if="任何一条确认条件失效；若 notional 超过薄流动性阈值则取消。",
                 template_risk_note="高 beta 小币只允许确认后参与，禁止直接用市场单追入。",
+                operator_steps="1. 先确认 trigger 2. 先极小仓试单 3. 放量确认前不追加",
+                post_fill_protocol="若第一笔试单后流动性明显恶化，停止后续执行。",
+                review_after_hours="2h",
             )
         else:
             rules.update(
@@ -703,6 +749,9 @@ class TradePipeline:
                 confirmation_checklist="按 trigger / invalidation / zone 人工确认。",
                 cancel_if="市场条件与 thesis 不再匹配。",
                 template_risk_note="默认人工审查模板。",
+                operator_steps="按触发价和失效价手工确认后再下单。",
+                post_fill_protocol="成交后重新检查 thesis 是否仍有效。",
+                review_after_hours="8h",
             )
 
         thin_threshold = float(getattr(self.config.risk, "thin_liquidity_market_order_notional_usdt", 15_000.0))
@@ -711,6 +760,9 @@ class TradePipeline:
             rules["preferred_order_type"] = "laddered_limit_only"
         if btc_regime in {"panic_flush", "risk_off_trend"} and asset_tier != "core":
             rules["template_risk_note"] += " BTC 风险关闭时，山寨币执行只能更保守。"
+        if narrative_tag == "meme":
+            rules["template_risk_note"] += " Meme 币叙事波动大，优先轻仓、分批、快进快出。"
+            rules["max_slippage_bps"] = min(rules["max_slippage_bps"], 5)
 
         return rules
 
@@ -972,6 +1024,8 @@ class TradePipeline:
         risk: RiskDecision,
         result: ExecutionResult,
         reflections: list[dict],
+        portfolio_snapshot: dict,
+        portfolio_budget: dict,
     ) -> Optional[str]:
         try:
             vault = VaultReader(self.config.vault)
@@ -986,6 +1040,8 @@ class TradePipeline:
                 risk=risk,
                 result=result,
                 reflections=reflections,
+                portfolio_snapshot=portfolio_snapshot,
+                portfolio_budget=portfolio_budget,
             )
             path = vault.write_report(filename=f"交易执行-{symbol}-{timestamp}", content=content)
             console.print(f"[green]✓ Vault report: {path}[/green]")
@@ -1010,6 +1066,8 @@ def _build_report(
     risk: RiskDecision,
     result: ExecutionResult,
     reflections: list[dict],
+    portfolio_snapshot: dict,
+    portfolio_budget: dict,
 ) -> str:
     mode = "（模拟运行）" if account_summary.get("dry_run") else ""
     lines: list[str] = [
@@ -1050,8 +1108,20 @@ def _build_report(
         f"- 7d 实现波动：{market_snapshot.get('realized_vol_7d_pct', 'N/A')}%",
         f"- 波动状态：{market_snapshot.get('volatility_regime', 'N/A')}",
         f"- 动量状态：{market_snapshot.get('momentum_regime', 'N/A')}",
+        f"- 叙事标签：{market_snapshot.get('narrative_tag', 'N/A')}",
         "",
-        "## 四、研究结论 (ResearchDecision)\n",
+        "## 四、组合层快照\n",
+        f"- 总资产：${portfolio_snapshot.get('total_balance_usdt', 0):,.2f}",
+        f"- Gross Exposure：{portfolio_snapshot.get('gross_exposure_pct', 0):.1f}%",
+        f"- Net Exposure：{portfolio_snapshot.get('net_exposure_pct', 0):.1f}%",
+        f"- 持仓数：{portfolio_snapshot.get('position_count', 0)}",
+        f"- Narrative：{portfolio_budget.get('narrative_tag', 'N/A')}",
+        f"- Portfolio Role：{portfolio_budget.get('portfolio_role', 'N/A')}",
+        f"- 推荐最大仓位：{portfolio_budget.get('recommended_max_size_pct', 'N/A')}%",
+        f"- Tier Hard Cap：{portfolio_budget.get('hard_cap_size_pct', 'N/A')}%",
+        f"- 组合预算理由：{portfolio_budget.get('rationale', 'N/A')}",
+        "",
+        "## 五、研究结论 (ResearchDecision)\n",
         f"- **交易对**：{research.symbol}",
         f"- **方向**：{research.stance.upper()}",
         f"- **信心**：{research.confidence:.1%}",
@@ -1073,7 +1143,7 @@ def _build_report(
         f"- **时间周期**：{research.time_horizon}",
         f"- **首选市场**：{research.preferred_market}",
         "",
-        "## 五、执行计划 (ExecutionPlan)\n",
+        "## 六、执行计划 (ExecutionPlan)\n",
         f"- **动作**：{plan.action}",
         f"- **仓位大小**：{plan.size_pct:.1f}% 账户",
         f"- **杠杆**：{plan.leverage}x",
@@ -1082,7 +1152,7 @@ def _build_report(
         f"- **止盈**：{plan.take_profit_pct:.1f}%",
         f"- **理由**：{plan.rationale}",
         "",
-        "## 六、风险审批 (RiskDecision)\n",
+        "## 七、风险审批 (RiskDecision)\n",
         f"- **审批结果**：{'✅ 通过' if risk.approved else '❌ 拒绝'}",
     ]
 
@@ -1102,7 +1172,7 @@ def _build_report(
         f"- **调整后杠杆**：{adj_lev}",
         f"- **理由**：{risk.rationale}",
         "",
-        "## 七、最终执行结果 (ExecutionResult)\n",
+        "## 八、最终执行结果 (ExecutionResult)\n",
         f"- **状态**：`{result.status}`",
         f"- **是否执行**：{'是' if result.executed else '否'}",
         f"- **最终动作**：{result.final_action}",
@@ -1117,12 +1187,12 @@ def _build_report(
     if result.order_ids:
         lines.append(f"- **订单 ID**：{', '.join(result.order_ids)}")
     if result.manual_order_details:
-        lines += ["", "## 八、手动下单明细\n"]
+        lines += ["", "## 九、手动下单明细\n"]
         for k, v in result.manual_order_details.items():
             lines.append(f"- **{k}**：{v}")
 
     if reflections:
-        lines += ["", "## 九、历史反思摘要\n"]
+        lines += ["", "## 十、历史反思摘要\n"]
         for ref in reflections[:3]:
             lines.append(f"### {ref.get('symbol', '—')} — {ref.get('created_at', '')}")
             lessons = ref.get("lessons") or []
@@ -1133,7 +1203,7 @@ def _build_report(
 
     lines += [
         "",
-        "## 十、最终结论\n",
+        "## 十一、最终结论\n",
         f"本次 **{symbol}** 分析完成。",
         f"- AI 研判方向：**{research.stance.upper()}**，信心 {research.confidence:.1%}",
         f"- 建议动作：**{plan.action}**，仓位 {plan.size_pct:.1f}%，杠杆 {plan.leverage}x",

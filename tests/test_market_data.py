@@ -108,6 +108,12 @@ class TestMarketDataManager:
         snap = mgr.get_market_snapshot("SOMEALTUSDT")
         assert snap.asset_tier == "high_beta_alt"
         assert snap.crowding_regime in {"crowded_long", "heavy_positioning"}
+        assert snap.narrative_tag == "general_alt"
+
+    def test_meme_coin_gets_meme_narrative(self, market_config):
+        mgr = MarketDataManager(market_config.binance, dry_run=True)
+        snap = mgr.get_market_snapshot("DOGEUSDT")
+        assert snap.narrative_tag == "meme"
 
     def test_btc_regime_state_machine_detects_panic_flush(self, market_config):
         mgr = MarketDataManager(market_config.binance, dry_run=False)
@@ -288,6 +294,121 @@ class TestCryptoRiskRules:
         assert decision.adjusted_size_pct <= 2.5
         assert decision.adjusted_leverage <= 5
         assert any("crowded long" in w.lower() for w in decision.warnings)
+
+    def test_meme_narrative_tightens_risk(self, market_config):
+        gate = RiskGate(market_config)
+        plan = ExecutionPlan(
+            action="open_long",
+            size_pct=3.0,
+            leverage=5,
+            entry_idea="meme breakout",
+            stop_loss_pct=5.0,
+            take_profit_pct=20.0,
+            rationale="meme move",
+        )
+        decision = gate.evaluate(
+            plan,
+            account_snapshot={"drawdown_pct": 0.0},
+            positions=[],
+            market_snapshot={
+                "asset_tier": "major_alt",
+                "narrative_tag": "meme",
+                "crowding_regime": "balanced",
+                "hourly_trend_bias": "bullish",
+                "realized_vol_24h_pct": 7.0,
+                "price_change_24h_pct": 6.0,
+                "funding_rate": 0.0,
+                "basis_bps": 0.0,
+            },
+        )
+        assert decision.adjusted_leverage == market_config.risk.meme_max_leverage
+        assert decision.adjusted_size_pct == market_config.risk.meme_max_position_size_pct * 100
+        assert any("Meme" in w for w in decision.warnings)
+
+    def test_meme_under_btc_risk_off_defaults_to_hold(self, market_config):
+        gate = RiskGate(market_config)
+        plan = ExecutionPlan(
+            action="open_long",
+            size_pct=2.0,
+            leverage=3,
+            entry_idea="meme bounce",
+            stop_loss_pct=5.0,
+            take_profit_pct=15.0,
+            rationale="meme bounce",
+        )
+        decision = gate.evaluate(
+            plan,
+            account_snapshot={"drawdown_pct": 0.0},
+            positions=[],
+            market_snapshot={
+                "benchmark_symbol": "BTCUSDT",
+                "btc_market_regime": "panic_flush",
+                "narrative_tag": "meme",
+                "asset_tier": "major_alt",
+                "crowding_regime": "balanced",
+                "hourly_trend_bias": "bullish",
+                "realized_vol_24h_pct": 7.0,
+                "price_change_24h_pct": 3.0,
+                "funding_rate": 0.0,
+                "basis_bps": 0.0,
+            },
+        )
+        assert decision.adjusted_action == "hold"
+        assert decision.adjusted_size_pct == 0.0
+        assert any("no-trade" in w for w in decision.warnings)
+
+    def test_narrative_concentration_warns(self, market_config):
+        gate = RiskGate(market_config)
+        plan = ExecutionPlan(
+            action="open_long",
+            size_pct=4.0,
+            leverage=5,
+            entry_idea="defi continuation",
+            stop_loss_pct=5.0,
+            take_profit_pct=12.0,
+            rationale="defi cluster",
+        )
+        decision = gate.evaluate(
+            plan,
+            account_snapshot={"drawdown_pct": 0.0},
+            positions=[
+                {"symbol": "AAVEUSDT", "direction": "LONG"},
+                {"symbol": "UNIUSDT", "direction": "LONG"},
+            ],
+            market_snapshot={
+                "narrative_tag": "defi",
+                "asset_tier": "major_alt",
+                "hourly_trend_bias": "bullish",
+                "realized_vol_24h_pct": 5.0,
+                "price_change_24h_pct": 2.0,
+                "funding_rate": 0.0,
+                "basis_bps": 0.0,
+            },
+        )
+        assert any("concentration risk" in w for w in decision.warnings)
+        assert decision.adjusted_size_pct <= 1.5
+
+    def test_portfolio_budget_hard_cap_blocks_new_risk(self, market_config):
+        gate = RiskGate(market_config)
+        plan = ExecutionPlan(
+            action="open_long",
+            size_pct=4.0,
+            leverage=5,
+            entry_idea="new long",
+            stop_loss_pct=5.0,
+            take_profit_pct=10.0,
+            rationale="new long",
+        )
+        decision = gate.evaluate(
+            plan,
+            account_snapshot={"drawdown_pct": 0.0},
+            positions=[],
+            market_snapshot={"asset_tier": "major_alt"},
+            portfolio_snapshot={"gross_exposure_pct": 130.0},
+            portfolio_budget={"recommended_max_size_pct": 1.0, "hard_cap_size_pct": 2.0},
+        )
+        assert decision.approved is False
+        assert decision.adjusted_action == "hold"
 
     def test_btc_rebound_warns_against_new_alt_shorts(self, market_config):
         gate = RiskGate(market_config)

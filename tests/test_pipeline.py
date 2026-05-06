@@ -211,6 +211,37 @@ class TestPipelineWithApi:
             patch.object(pipeline.advisor, "generate_research", return_value=_mock_research()),
             patch.object(pipeline.advisor, "generate_execution_plan", return_value=_mock_plan()),
             patch.object(pipeline, "_get_vault_context", return_value=""),
+            patch.object(
+                pipeline,
+                "_get_market_snapshot",
+                return_value={
+                    "symbol": "BTCUSDT",
+                    "spot_price": 50000.0,
+                    "futures_mark_price": 50000.0,
+                    "price_change_24h_pct": 3.0,
+                    "price_change_7d_pct": 12.0,
+                    "quote_volume_24h_usdt": 1_500_000_000.0,
+                    "funding_rate": 0.0005,
+                    "open_interest": 1_000_000.0,
+                    "oi_to_volume_ratio": 0.4,
+                    "basis_bps": 20.0,
+                    "ema_21_1h": 49500.0,
+                    "ema_55_1h": 48500.0,
+                    "ema_144_1h": 47000.0,
+                    "distance_to_ema21_pct": 1.0,
+                    "distance_to_ema55_pct": 3.0,
+                    "distance_to_7d_high_pct": -1.0,
+                    "distance_to_7d_low_pct": 8.0,
+                    "hourly_trend_bias": "bullish",
+                    "asset_tier": "core",
+                    "liquidity_regime": "deep",
+                    "crowding_regime": "balanced",
+                    "volatility_regime": "normal",
+                    "momentum_regime": "strong_up",
+                    "btc_market_regime": "risk_on_trend",
+                    "execution_template": "core_trend_follow",
+                },
+            ),
             patch("trading.pipeline.runner.BinanceClient") as MockBinance,
             patch("trading.pipeline.runner.AccountManager") as MockAccount,
             patch("trading.pipeline.runner.PositionManager") as MockPosition,
@@ -242,7 +273,55 @@ class TestPipelineWithApi:
         assert result.manual_order_details["symbol"] == "BTCUSDT"
         assert result.manual_order_details["side"] == "BUY"
         assert result.manual_order_details["stop_loss_price"] is not None
+        assert result.manual_order_details["execution_template"] == "core_trend_follow"
+        assert result.manual_order_details["preferred_order_type"] == "market_or_passive_limit"
+        assert "40% starter" in result.manual_order_details["staging_plan"]
+        assert "先下 40% 观察仓" in result.manual_order_details["operator_steps"]
+        assert result.manual_order_details["review_after_hours"] == "12h"
+        assert pipeline.last_portfolio_budget["portfolio_role"] == "anchor"
         assert "自动下单已禁用" in (result.execution_reason or "")
+
+    def test_high_beta_template_produces_limit_only_ticket(self, config_with_api):
+        pipeline = TradePipeline(config=config_with_api, dry_run=False)
+        ticket = pipeline._template_execution_rules(
+            {
+                "execution_template": "high_beta_confirmation_only",
+                "btc_market_regime": "range",
+                "asset_tier": "high_beta_alt",
+                "narrative_tag": "general_alt",
+                "notional_usdt": 20_000.0,
+            }
+        )
+        assert ticket["preferred_order_type"] == "laddered_limit_only"
+        assert "确认后参与" in ticket["template_risk_note"]
+
+    def test_meme_template_has_tighter_manual_rules(self, config_with_api):
+        pipeline = TradePipeline(config=config_with_api, dry_run=False)
+        ticket = pipeline._template_execution_rules(
+            {
+                "execution_template": "alt_follow_with_confirmation",
+                "btc_market_regime": "risk_on_trend",
+                "asset_tier": "major_alt",
+                "narrative_tag": "meme",
+                "notional_usdt": 5_000.0,
+            }
+        )
+        assert ticket["max_slippage_bps"] <= 5
+        assert "Meme 币叙事" in ticket["template_risk_note"]
+
+    def test_meme_template_note_is_more_conservative(self, config_with_api):
+        pipeline = TradePipeline(config=config_with_api, dry_run=False)
+        ticket = pipeline._template_execution_rules(
+            {
+                "execution_template": "alt_follow_with_confirmation",
+                "btc_market_regime": "risk_on_trend",
+                "asset_tier": "major_alt",
+                "narrative_tag": "meme",
+                "notional_usdt": 5_000.0,
+            }
+        )
+        assert ticket["max_slippage_bps"] <= 5
+        assert "Meme 币叙事" in ticket["template_risk_note"]
 
     def test_blocked_by_risk_with_api_configured(self, config_with_api):
         oversized_plan = ExecutionPlan(

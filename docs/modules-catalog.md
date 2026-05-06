@@ -1,67 +1,68 @@
 # 模块清单
 
-> 变更此文件时，同步更新 `.qoder/rules/project-architecture.md` 的模块清单表。
+> 本文件描述当前仓库的**真实实现状态**，不是历史规划。
 
 ## core/ · 基础设施层
 
 | 模块 | 文件 | 主要导出 | 责任 |
 |------|------|---------|------|
-| config | `src/trading/core/config.py` | `AppConfig`, `load_config`, `VaultConfig`, `BinanceConfig`, `ClaudeConfig`, `RiskConfig`, `TradingConfig`, `MonitorConfig`, `LoggingConfig` | 从 config.yaml + .env + CLI 参数合并配置，提供强类型 dataclass |
-| vault | `src/trading/core/vault.py` | `VaultReader` | Obsidian Vault 读写：交易体系文档、持仓追踪、研究报告 |
-| logger | `src/trading/core/logger.py` | `TradingLogger`, `SQLiteHandler` | Rich 控制台 + SQLite 双输出结构化日志 |
+| config | `src/trading/core/config.py` | `AppConfig`, `load_config`, `VaultConfig`, `BinanceConfig`, `ClaudeConfig`, `RiskConfig`, `TradingConfig`, `MonitorConfig`, `LoggingConfig` | 合并 `config.yaml + .env + CLI` 配置，承载币圈风险、叙事与执行模板参数 |
+| vault | `src/trading/core/vault.py` | `VaultReader` | Obsidian Vault 读写：交易体系、持仓追踪、研究报告、AI 执行报告 |
+| logger | `src/trading/core/logger.py` | `TradingLogger`, `SQLiteHandler` | Rich 控制台 + SQLite 双写日志 |
+| journal | `src/trading/core/journal.py` | `TradeJournal`, `TradeRecord` | 已平仓交易记录、复盘统计、Rich 表输出 |
 
 **导出入口**：`src/trading/core/__init__.py`
-```python
-from .config import AppConfig, BinanceConfig, load_config
-from .logger import TradingLogger
-from .vault import VaultReader
-```
 
 ---
 
-## exchange/ · 交易所适配层
+## exchange/ · 交易所与市场数据层
 
 | 模块 | 文件 | 主要导出 | 责任 |
 |------|------|---------|------|
 | client | `src/trading/exchange/client.py` | `BinanceClient` | Binance Spot + UMFutures 统一封装，支持 testnet 和 dry_run |
-| um_futures | `src/trading/exchange/um_futures.py` | （内部） | UMFutures 兼容层；binance-connector 3.x 不含 `um_futures` 子模块，本地封装 `/fapi/` 端点 |
-| account | `src/trading/exchange/account.py` | `AccountManager`, `Balance`, `FuturesBalance`, `AccountPnL` | 余额查询（现货+合约）、P&L 计算 |
-| positions | `src/trading/exchange/positions.py` | `PositionManager`, `FuturesPosition`, `SpotPosition` | 合约持仓 + 现货持仓查询，计算名义价值 |
-| orders | `src/trading/exchange/orders.py` | `OrderManager`, `Order` | 市价单、限价单、止损单、止盈单下单与撤单 |
+| um_futures | `src/trading/exchange/um_futures.py` | `UMFutures` | `/fapi` 兼容层：账户、订单、标记价格、open interest、24h ticker、K 线、杠杆、仓位模式 |
+| account | `src/trading/exchange/account.py` | `AccountManager`, `Balance`, `FuturesBalance`, `AccountPnL` | 现货/合约余额与账户 P&L |
+| positions | `src/trading/exchange/positions.py` | `PositionManager`, `FuturesPosition`, `SpotPosition` | 当前现货/合约仓位与聚合统计 |
+| orders | `src/trading/exchange/orders.py` | `OrderManager`, `Order` | 底层下单/撤单能力；当前主流程已切换为人工下单模式，不自动调用真实下单 |
+| market_data | `src/trading/exchange/market_data.py` | `MarketDataManager`, `MarketSnapshot`, `infer_narrative_tag` | 币圈专用公开市场快照：价格、波动、funding、OI、basis、BTC regime、叙事、执行模板 |
 
 **导出入口**：`src/trading/exchange/__init__.py`
-```python
-from .client import BinanceClient
-from .account import AccountManager
-from .positions import PositionManager
-from .orders import OrderManager
-```
 
 ---
 
-## ai/ · AI 分析层（Phase 2，待实现）
+## ai/ · AI 研究与计划层
 
-| 模块 | 文件 | 计划导出 | 责任 |
+| 模块 | 文件 | 主要导出 | 责任 |
 |------|------|---------|------|
-| client | `src/trading/ai/client.py` | `ClaudeClient` | Claude API 封装，支持 Prompt Caching |
-| prompts | `src/trading/ai/prompts/` | Prompt 模板函数 | 持仓分析、币种调研、决策建议三类 Prompt |
+| client | `src/trading/ai/client.py` | `ClaudeClient` | Claude API 调用、JSON 抽取、prompt cache 控制 |
+| schemas | `src/trading/ai/schemas.py` | `ResearchDecision`, `ExecutionPlan`, `RiskDecision`, `ExecutionResult` | AI 研究、执行计划、风控结果、人工下单清单的结构化模型 |
+| advisor | `src/trading/ai/advisor.py` | `TradingAdvisor` | 组织研究、执行计划与反思调用 |
+| prompts | `src/trading/ai/prompts/__init__.py` | `build_research_prompt`, `build_execution_prompt`, `build_reflection_prompt` | 面向币圈的 prompt：价格结构、BTC regime、叙事、execution template |
 
 ---
 
-## risk/ · 风控层（Phase 3，待实现）
+## risk/ · 确定性风控层
 
-| 模块 | 文件 | 计划导出 | 责任 |
+| 模块 | 文件 | 主要导出 | 责任 |
 |------|------|---------|------|
-| monitor | `src/trading/risk/monitor.py` | `RiskMonitor` | L1/L2/L3 熔断检测，BTC 黑天鹅检测 |
-| circuit_breaker | `src/trading/risk/circuit_breaker.py` | `CircuitBreaker` | 自动平仓、暂停交易执行 |
+| gate | `src/trading/risk/gate.py` | `RiskGate` | 币圈专用规则风控：仓位/杠杆上限、波动过滤、funding/basis/OI 拥挤度、BTC risk regime、叙事与模板差异化风险覆盖 |
 
 ---
 
-## reports/ · 报告层（Phase 2，待实现）
+## pipeline/ · AI 交易执行编排层
 
-| 模块 | 文件 | 计划导出 | 责任 |
+| 模块 | 文件 | 主要导出 | 责任 |
 |------|------|---------|------|
-| generator | `src/trading/reports/generator.py` | `ReportGenerator` | AI 分析结果格式化为 Vault Markdown |
+| runner | `src/trading/pipeline/runner.py` | `TradePipeline`, `is_trading_api_configured` | 真实主链：账户/仓位/市场快照 → ResearchDecision → ExecutionPlan → RiskGate → 手动下单清单 → Vault/SQLite 持久化 |
+| persistence | `src/trading/pipeline/persistence.py` | `TradeRunDB` | 保存完整 pipeline run、market snapshot、execution result 与 reflection |
+
+---
+
+## reports/ · 报告输出层
+
+| 模块 | 文件 | 主要导出 | 责任 |
+|------|------|---------|------|
+| *(内嵌于 pipeline)* | `src/trading/pipeline/runner.py::_build_report` | — | 当前没有独立 generator；执行报告由 pipeline 内部构建并写入 Vault |
 
 ---
 
@@ -69,24 +70,40 @@ from .orders import OrderManager
 
 | 命令 | 函数 | 描述 |
 |------|------|------|
-| `trading account` | `account()` | 显示账户余额 + 合约持仓 + P&L |
-| `trading sync` | `sync()` | 同步持仓到 Obsidian Vault（默认 dry_run） |
-| `trading status` | `status()` | 检查系统组件状态 |
+| `trading account` | `account()` | 查看账户余额、持仓与 P&L，支持 dry-run mock |
+| `trading sync` | `sync()` | 同步持仓到 Vault；`--dry-run` 现在也走安全 mock 预览 |
+| `trading status` | `status()` | 检查 Vault / Binance / Claude 状态 |
+| `trading record` | `record()` | 录入已平仓交易 |
+| `trading journal` | `journal()` | 查看交易日志与统计 |
+| `trading trade` | `trade()` | 运行完整币圈 AI 交易流程，输出**手动下单清单**，不自动下单 |
+| `trading reflect` | `reflect()` | 基于历史平仓交易生成 AI 反思 |
 
 ---
 
-## 数据类速查
+## 运行链速记
+
+`trading trade` 的当前真实链路：
+
+1. `load_config()` 载入配置
+2. `TradePipeline.run()` 收集账户、仓位、`MarketSnapshot`、Vault 上下文、历史交易、历史反思
+3. `TradingAdvisor.generate_research()` 生成 `ResearchDecision`
+4. `TradingAdvisor.generate_execution_plan()` 生成 `ExecutionPlan`
+5. `RiskGate.evaluate()` 应用币圈专用规则风控
+6. `TradePipeline._build_manual_order_ticket()` 产出人工执行清单
+7. `_build_report()` 写入 Vault
+8. `TradeRunDB.save_run()` 写入 SQLite
+
+---
+
+## 重点数据类速查
 
 | 类名 | 所在模块 | 用途 |
 |------|---------|------|
-| `AppConfig` | core.config | 顶层配置聚合对象 |
-| `VaultConfig` | core.config | Vault 路径配置 |
-| `BinanceConfig` | core.config | Binance API 配置 |
-| `ClaudeConfig` | core.config | Claude AI 配置 |
-| `RiskConfig` | core.config | 风控参数 |
-| `Balance` | exchange.account | 现货资产余额 |
-| `FuturesBalance` | exchange.account | 合约账户余额 |
-| `AccountPnL` | exchange.account | 账户级 P&L |
-| `FuturesPosition` | exchange.positions | 合约持仓 |
-| `SpotPosition` | exchange.positions | 现货持仓 |
-| `Order` | exchange.orders | 订单信息 |
+| `AppConfig` | `core.config` | 顶层配置聚合对象 |
+| `RiskConfig` | `core.config` | 币圈风险、叙事和模板阈值 |
+| `MarketSnapshot` | `exchange.market_data` | 价格、结构、拥挤度、BTC regime、叙事、模板 |
+| `ResearchDecision` | `ai.schemas` | AI 研究结论 |
+| `ExecutionPlan` | `ai.schemas` | AI 执行计划 |
+| `RiskDecision` | `ai.schemas` | 确定性风控裁决 |
+| `ExecutionResult` | `ai.schemas` | 最终执行结果（当前为手动下单模式） |
+| `TradeRecord` | `core.journal` | 已平仓交易记录 |

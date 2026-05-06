@@ -1,281 +1,266 @@
-# 🤖 Trading Bot - AI 交易助手
+# Trading Bot
 
-基于 Obsidian Vault 知识体系的智能加密货币交易助手。
+面向**区块链 / 币圈投资**的 AI 研究、风控与人工执行系统。
 
-## 📋 核心特性
+当前系统的核心定位不是“自动化下单机器人”，而是：
 
-### ✅ Phase 1：基础框架 + 币安连接
-- ✓ Binance API 集成（现货 + 合约）
-- ✓ 账户余额与 P&L 查询
-- ✓ 持仓管理和同步
-- ✓ 结构化日志系统
-- ✓ Obsidian Vault 知识库读写
-
-### 🔄 Phase 2：Claude AI 分析引擎（规划中）
-- Claude API 集成 + Prompt Caching
-- 持仓智能分析与建议
-- 币种调研报告生成
-- 决策建议自动化
-
-### ⚙️ Phase 3：风控自动化（规划中）
-- 账户级熔断机制（L1/L2/L3）
-- 止损/止盈管理
-- BTC 黑天鹅检测
-- 实时 WebSocket 监控
-
-### 🎯 Phase 4：完整工作流（规划中）
-- 交互式确认界面
-- 自动报告生成
-- 完整测试覆盖
+1. 读取 Binance 账户、仓位与公开市场数据
+2. 结合 Obsidian Vault 中的个人交易体系做 AI 研究
+3. 用确定性风控过滤研究结果
+4. 输出**手动下单清单（manual order ticket）**
+5. 把运行结果、市场快照与反思沉淀到 SQLite / Vault
 
 ---
 
-## 🚀 快速开始
+## 当前能力
 
-### 前置要求
-- Python 3.11+
-- Binance API 密钥
-- Anthropic Claude API 密钥
-- Obsidian Vault 已配置
+### 1. 账户与仓位
 
-### 安装
+- Binance Spot + USDT-M Futures 账户读取
+- 现货 / 合约余额查询
+- 当前持仓与未实现 P&L 查询
+- `account --dry-run` mock 预览
+
+### 2. 币圈市场快照
+
+每次 `trading trade` 会生成 `MarketSnapshot`，包括：
+
+- 现货价 / 合约标记价
+- 24h / 7d 涨跌
+- 24h 成交额
+- funding rate
+- open interest
+- basis
+- 24h / 7d realized volatility
+- EMA21 / EMA55 / EMA144
+- 1h 趋势偏向
+- 资产层级（`core / major_alt / liquid_alt / mid_alt / high_beta_alt`）
+- 叙事标签（`meme / defi / layer2 / ai_agent ...`）
+- 流动性状态
+- 拥挤度
+- BTC 市场状态机
+- 相对 BTC 强弱
+- execution template
+
+### 3. AI 研究与执行计划
+
+AI 会输出：
+
+- `ResearchDecision`
+  - thesis
+  - market_structure
+  - evidence
+  - catalysts / risks
+  - invalidation
+  - time_horizon
+  - preferred_market
+
+- `ExecutionPlan`
+  - action
+  - size_pct / leverage
+  - entry_style
+  - entry zone
+  - trigger / invalidation price
+  - stop / take profit
+  - thesis_window_hours
+
+### 4. 币圈专用 RiskGate
+
+当前风控覆盖：
+
+- 仓位上限 / 杠杆上限
+- 账户 drawdown 熔断
+- 高波动压杠杆 / 压仓
+- funding / basis / OI 拥挤度
+- BTC risk-on / risk-off / panic flush / rebound / short squeeze 过滤
+- alt 相对 BTC 强弱过滤
+- `high_beta_alt` 更严格限制
+- `meme` 更严格限制
+- execution template 专属规则
+- 同叙事持仓集中警告
+
+### 5. 手动下单清单
+
+当前 `trading trade` 默认**不自动下单**，而是输出：
+
+- side / quantity / notional / leverage
+- entry zone / trigger / invalidation
+- stop / take profit
+- execution template
+- preferred order type
+- staging plan
+- max slippage
+- operator steps
+- confirmation checklist
+- cancel conditions
+- review window
+
+也就是更像“币圈交易执行操作手册”，而不是直接代替你按下单按钮。
+
+---
+
+## 主要命令
 
 ```bash
-# 1. 复制 .env.example 为 .env
-cp .env.example .env
+# 系统状态
+trading status
 
-# 2. 编辑 .env，填入 API 密钥
-vi .env
+# 账户与持仓
+trading account
+trading account --dry-run
 
-# 3. 安装依赖（使用 pip）
-pip install -e .
+# 同步持仓到 Vault
+trading sync --dry-run
+trading sync --no-dry-run
 
-# 或使用 uv（推荐）
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# 运行完整币圈 AI 交易流程（输出手动下单清单）
+trading trade BTCUSDT
+trading trade ETHUSDT --dry-run
+
+# 录入已平仓交易
+trading record CHZUSDT --side long --entry 0.05 --exit 0.068 --qty 128000 --leverage 30 --open "2025-01-01 10:00"
+
+# 查看交易日志
+trading journal
+
+# 生成交易反思
+trading reflect --symbol BTCUSDT
+```
+
+---
+
+## 安装
+
+```bash
+pip install -e ".[dev]"
+```
+
+或：
+
+```bash
 uv sync
 ```
 
-### 基本命令
+---
+
+## 配置
+
+### .env
+
+至少需要：
+
+```env
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
+ANTHROPIC_API_KEY=...
+```
+
+### config.yaml
+
+最重要的配置块：
+
+- `vault`
+- `risk`
+- `trading`
+- `logging`
+
+现在 `risk` 已经包含不少币圈专用参数，例如：
+
+- 高波动阈值
+- funding 拥挤阈值
+- alt 相对 BTC 弱势阈值
+- high beta alt 风险参数
+- meme 风险参数
+- narrative thesis window 限制
+
+---
+
+## 运行模式
+
+### `account --dry-run`
+
+- 使用 mock 账户与 mock 持仓
+- 不访问真实 Binance
+
+### `sync --dry-run`
+
+- 使用 mock 持仓
+- 只做 Vault 内容预览
+- 不访问真实 Binance
+- 不写 Vault
+
+### `trade --dry-run`
+
+- 使用 mock 账户快照与 mock 市场快照
+- 仍然会完整跑：
+  - AI 研究
+  - AI 执行计划
+  - 风控
+  - 手动下单清单
+
+### `trade`（非 dry-run）
+
+- 会读取真实 Binance 账户/仓位/市场快照
+- 会输出真实手动下单清单
+- **不会自动真实下单**
+
+---
+
+## 目录结构
+
+```text
+src/trading/
+├── core/         # config / vault / logger / journal
+├── exchange/     # Binance 账户、仓位、订单、市场快照
+├── ai/           # Claude client / prompts / schemas / advisor
+├── risk/         # deterministic risk gate
+├── pipeline/     # end-to-end trade pipeline + persistence
+├── reports/      # 预留（当前报告构建在 pipeline 内）
+└── main.py       # CLI
+```
+
+---
+
+## 测试
 
 ```bash
-# 查看账户余额和持仓
-trading account
-
-# 同步持仓到 Vault（预览模式）
-trading sync
-
-# 实际写入 Vault（谨慎！）
-trading sync --no-dry-run
-
-# 查看系统状态
-trading status
-
-# 帮助
-trading --help
+python -m pytest -q
 ```
 
----
+当前测试已覆盖：
 
-## 📂 项目结构
-
-```
-trading-bot/
-├── src/trading/
-│   ├── core/              # 核心模块
-│   │   ├── config.py      # 配置管理
-│   │   ├── vault.py       # Vault 读写
-│   │   └── logger.py      # 日志系统
-│   ├── exchange/          # 币安交互
-│   │   ├── client.py      # 基础客户端
-│   │   ├── account.py     # 账户管理
-│   │   ├── positions.py   # 持仓查询
-│   │   ├── orders.py      # 订单管理
-│   │   └── stream.py      # WebSocket 流
-│   ├── ai/                # AI 分析（Phase 2）
-│   ├── risk/              # 风控模块（Phase 3）
-│   ├── reports/           # 报告生成（Phase 2）
-│   └── main.py            # CLI 入口
-├── tests/                 # 单元测试
-├── data/                  # 本地数据
-│   └── trades.db          # SQLite 日志
-├── config.yaml            # 风控参数
-├── .env.example           # 密钥模板
-├── .env                   # 实际密钥（gitignore）
-├── pyproject.toml         # 依赖定义
-└── README.md              # 本文件
-```
+- exchange
+- journal
+- schemas
+- pipeline
+- risk gate
+- market data
+- CLI safe preview behavior
+- 回归修复
 
 ---
 
-## ⚙️ 配置说明
+## 当前边界
 
-### config.yaml 关键参数
+当前已实现：
 
-```yaml
-# 风控参数（从交易体系提取）
-risk:
-  max_account_drawdown: -0.20    # L2：全部平仓
-  alert_drawdown: -0.10          # L1：告警
-  suspend_drawdown: -0.30        # L3：暂停交易
-  max_leverage: 35               # 杠杆上限
-  btc_crash_threshold: -0.10     # BTC -10% 触发减仓
-  btc_black_swan: -0.15          # BTC -15% 触发
-```
+- 币圈市场快照
+- AI 研究
+- AI 执行计划
+- 币圈专用风控
+- 手动执行清单
+- Vault 报告
+- SQLite 持久化
+- 交易反思
 
-### .env 必填项
+当前尚未实现：
 
-```
-BINANCE_API_KEY=your_key_here
-BINANCE_API_SECRET=your_secret_here
-ANTHROPIC_API_KEY=sk-ant-...
-```
+- 自动真实下单主链
+- 链上数据接入
+- 解锁/上币下币/治理/监管等事件源
+- 实时 WebSocket 风控守护
+- 组合层统一构建与动态调仓
 
----
+所以当前最准确的定位是：
 
-## 📊 Phase 1 命令详解
-
-### `trading account`
-显示账户概览：
-- 余额（现货 + 合约）
-- P&L 百分比
-- 所有开仓持仓
-- 杠杆信息
-
-```bash
-trading account
-trading account --dry-run
-```
-
-### `trading sync`
-同步持仓到 Vault：
-- 读取 Binance 实时持仓
-- 格式化为 Markdown 表格
-- 预览后写入 Vault `【持仓管理】/` 目录
-
-```bash
-trading sync              # 预览模式（默认安全）
-trading sync --no-dry-run # 真实写入
-```
-
-### `trading status`
-检查系统状态：
-- Vault 文件是否存在
-- Binance API 连接
-- Claude API 是否配置
-
----
-
-## 🛡️ 风控规则（硬编码）
-
-所有风控参数来自 Vault `合约交易体系-完整指南.md`：
-
-| 规则 | 触发条件 | 动作 |
-|------|---------|------|
-| **L1 告警** | 浮亏 -10% | 发出告警，建议减仓 |
-| **L2 清仓** | 浮亏 -20% | **自动全部平仓**（无需确认） |
-| **L3 暂停** | 浮亏 -30% | 禁止新交易 |
-| **BTC 暴跌** | 单日 -10% | 主动减仓 30% |
-| **黑天鹅** | 单日 -15% | 主动减仓 50% |
-| **利润锁定** | 浮盈 >50% | 锁定 50% 头寸 |
-| **止损** | 开仓即挂 | 3-5%，不可修改 |
-
----
-
-## 🔐 安全提示
-
-⚠️ **重要：**
-- `.env` 文件包含敏感信息，**绝不提交到 Git**
-- `--dry-run` 是默认模式，所有写操作必须显式确认
-- 在生产环境前充分测试所有命令
-- 定期检查日志 `data/trades.db`
-
----
-
-## 📈 开发进度
-
-### Phase 1 ✅
-- [x] 项目初始化
-- [x] 配置系统
-- [x] Vault 集成
-- [x] Binance API 连接
-- [x] CLI 框架（account, sync, status）
-- [x] 日志系统
-- [ ] 完整测试
-
-### Phase 2 🔄
-- [ ] Claude AI 客户端
-- [ ] Prompt Caching
-- [ ] 持仓分析 Prompt
-- [ ] 币种调研 Prompt
-- [ ] 决策建议 Prompt
-- [ ] CLI 命令：analyze, research, decision
-
-### Phase 3 📋
-- [ ] 风控守护进程
-- [ ] 熔断机制实现
-- [ ] 止损/止盈管理
-- [ ] 黑天鹅检测
-- [ ] WebSocket 流
-
-### Phase 4 📅
-- [ ] 交互式确认界面
-- [ ] 完整工作流集成
-- [ ] 性能优化
-- [ ] 生产就绪
-
----
-
-## 🧪 测试
-
-```bash
-# 运行所有测试
-python -m pytest tests/ -v
-
-# 运行特定测试
-python -m pytest tests/test_exchange.py -v
-
-# 生成覆盖率报告
-python -m pytest --cov=trading tests/
-```
-
----
-
-## 📞 日志和调试
-
-查看最近的日志：
-
-```bash
-python -c "
-from trading.core import TradingLogger, LoggingConfig
-config = LoggingConfig(sqlite_db='data/trades.db')
-table = TradingLogger.get_logs_table('data/trades.db', limit=20)
-from rich.console import Console
-Console().print(table)
-"
-```
-
----
-
-## 🤝 贡献
-
-目前为个人项目。欢迎反馈和改进建议！
-
----
-
-## 📄 许可
-
-私人项目。
-
----
-
-## 🎯 下一步
-
-1. **验证 Phase 1**：运行 `trading account` 确认连接正常
-2. **配置风控**：检查 `config.yaml` 中的风控参数
-3. **测试同步**：运行 `trading sync` 预览持仓同步
-4. **启动 Phase 2**：实现 Claude AI 分析引擎
-
----
-
-**最后更新**: 2024-12-15  
-**当前版本**: 0.1.0 (Phase 1 - Beta)
+> **面向币圈投资的 AI 研究 + 风控 + 人工执行操作系统**

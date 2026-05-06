@@ -70,6 +70,7 @@ Trading knowledge base:
         f"- Distance to 7d low: {market_snapshot.get('distance_to_7d_low_pct', 'N/A')}%",
         f"- Hourly trend bias: {market_snapshot.get('hourly_trend_bias', 'N/A')}",
         f"- Asset tier: {market_snapshot.get('asset_tier', 'N/A')}",
+        f"- Narrative tag: {market_snapshot.get('narrative_tag', 'N/A')}",
         f"- Liquidity regime: {market_snapshot.get('liquidity_regime', 'N/A')}",
         f"- Crowding regime: {market_snapshot.get('crowding_regime', 'N/A')}",
         f"- Momentum regime: {market_snapshot.get('momentum_regime', 'N/A')}",
@@ -77,6 +78,7 @@ Trading knowledge base:
         f"- BTC regime: {market_snapshot.get('btc_market_regime', 'N/A')}",
         f"- Relative strength vs BTC (24h): {market_snapshot.get('relative_strength_24h_pct', 'N/A')}%",
         f"- Relative strength vs BTC (7d): {market_snapshot.get('relative_strength_7d_pct', 'N/A')}%",
+        f"- Execution template: {market_snapshot.get('execution_template', 'N/A')}",
     ])
 
     pos_section = ""
@@ -179,12 +181,14 @@ Rules:
         f"- EMA21 / EMA55 / EMA144 (1h): {market_snapshot.get('ema_21_1h', 'N/A')} / {market_snapshot.get('ema_55_1h', 'N/A')} / {market_snapshot.get('ema_144_1h', 'N/A')}",
         f"- Hourly trend bias: {market_snapshot.get('hourly_trend_bias', 'N/A')}",
         f"- Asset tier: {market_snapshot.get('asset_tier', 'N/A')}",
+        f"- Narrative tag: {market_snapshot.get('narrative_tag', 'N/A')}",
         f"- Liquidity regime: {market_snapshot.get('liquidity_regime', 'N/A')}",
         f"- Crowding regime: {market_snapshot.get('crowding_regime', 'N/A')}",
         f"- Volatility regime: {market_snapshot.get('volatility_regime', 'N/A')}",
         f"- Momentum regime: {market_snapshot.get('momentum_regime', 'N/A')}",
         f"- BTC regime: {market_snapshot.get('btc_market_regime', 'N/A')}",
         f"- Relative strength vs BTC (7d): {market_snapshot.get('relative_strength_7d_pct', 'N/A')}%",
+        f"- Execution template: {market_snapshot.get('execution_template', 'N/A')}",
     ])
 
     pos_section = ""
