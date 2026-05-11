@@ -158,7 +158,7 @@ exchange:
 
 # Notification Configuration (Feishu Webhook)
 notification:
-  feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/e94aaac6-c776-4701-9a78-056b463b980e"
+  feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/485d26d3-a0a2-4561-9d79-b094974775b0"
   enabled: true
   on_risk_alert: true               # RiskDaemon 告警推送
   on_pipeline_complete: true        # Pipeline 完成通知
