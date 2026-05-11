@@ -40,6 +40,9 @@ monitor:
   interval_seconds: 60              # Risk check frequency
   price_stream_reconnect: true      # Auto-reconnect WebSocket
   stream_symbols: ["BTCUSDT", "ETHUSDT"]  # Symbols to stream
+  scan_symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # batch-trade default scan list
+  batch_top_n_signals: 5            # batch-trade 默认突出展示前 N 个机会
+  batch_auto_execute_max_candidates: 2  # batch auto-execute 最多放行前 N 中的几个
 
 # Trading Configuration
 trading:
@@ -50,6 +53,60 @@ trading:
   # Position sizing
   max_position_size_pct: 0.05       # Max 5% of account per position
   event_driven_max_pct: 0.05        # Event-driven trades max 5%
+
+  # Stable-mode preset: prefer fewer, cleaner setups over frequent trades
+  stable_mode_enabled: true
+  stable_min_confidence: 0.72
+  stable_min_consensus_strength: 0.67
+  stable_min_quality_score: 70.0
+  stable_min_reward_risk_ratio: 2.0
+  stable_max_position_size_pct: 0.02
+  stable_max_leverage: 5
+  stable_same_symbol_loss_cooldown_hours: 24
+  stable_loss_streak_block_count: 2
+  conviction_override_enabled: true
+  conviction_override_confidence: 0.85
+  conviction_override_consensus_strength: 0.75
+  conviction_override_min_quality_score: 55.0
+  conviction_override_min_reward_risk_ratio: 1.4
+  conviction_override_size_pct: 0.035
+  conviction_override_max_leverage: 8
+  conviction_override_require_multi_model: false
+  auto_execute_enabled: false
+  auto_execute_require_cli_flag: true
+  auto_execute_allowed_symbols: ["BTCUSDT", "ETHUSDT"]
+  auto_execute_allowed_markets: ["futures"]
+  auto_execute_min_confidence: 0.88
+  auto_execute_min_consensus_strength: 0.75
+  auto_execute_min_quality_score: 60.0
+  auto_execute_max_warning_count: 2
+  auto_execute_max_daily_orders: 3
+  auto_execute_max_daily_notional_usdt: 25000.0
+  auto_execute_max_batch_capital_pct: 6.0
+  auto_execute_symbol_cooldown_minutes: 60
+  auto_execute_block_on_open_orders: true
+  auto_execute_require_sl_tp: true
+  auto_execute_require_entry_zone_match: true
+  auto_execute_allowed_edge_labels: ["allowlist_promoted", "promoted"]
+  auto_execute_min_edge_expectancy_pnl_pct: 0.5
+  edge_policy_enabled: true
+  edge_policy_min_samples: 3
+  edge_policy_promote_min_expectancy_pnl_pct: 1.0
+  edge_policy_promote_min_profit_factor: 1.2
+  edge_policy_promote_size_multiplier: 1.15
+  edge_policy_block_max_expectancy_pnl_pct: -0.25
+  edge_policy_block_max_profit_factor: 0.9
+  edge_policy_block_negative_slices: true
+  edge_policy_allowlist: []
+  edge_policy_denylist: []
+  edge_policy_allowlist_size_multiplier: 1.25
+  edge_tune_max_entries_per_section: 2
+  stable_allowed_tiers: ["core", "major_alt", "liquid_alt"]
+  stable_blocked_narratives: ["meme"]
+  stable_allowed_btc_regimes: ["risk_on_trend", "rebound", "range"]
+
+  # AI optimization: merge research+execution into single API call (~30% token saving)
+  combined_ai_calls: true
 
 # Binance API Configuration (from .env)
 binance:
@@ -95,3 +152,29 @@ exchange:
   pairs:
     - "BTCUSDT"
     - "ETHUSDT"
+
+# Notification Configuration (Feishu Webhook)
+notification:
+  feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/e94aaac6-c776-4701-9a78-056b463b980e"
+  enabled: true
+  on_risk_alert: true               # RiskDaemon 告警推送
+  on_pipeline_complete: true        # Pipeline 完成通知
+  on_batch_scan: true               # 批量扫描结果推送
+  on_sl_tp_trigger: true            # SL/TP 触发告警
+
+# Event Sources Configuration (macro calendar + token unlocks)
+events:
+  enabled: true
+  macro_calendar_enabled: true      # ForexFactory macro economic calendar
+  token_unlocks_enabled: true       # DeFiLlama token unlock schedules
+  high_impact_hours_before: 24      # Hours before high-impact event to trigger risk reduction
+  high_impact_size_reduction: 0.5   # Reduce size by 50% near events
+  high_impact_max_leverage: 10      # Cap leverage at 10x near events
+
+# Portfolio Rebalance Configuration
+rebalance:
+  enabled: true
+  target_gross_exposure_pct: 70.0   # Target portfolio gross exposure %
+  deviation_threshold_pct: 15.0     # Only rebalance if position deviates > 15%
+  max_single_reduce_pct: 50.0       # Safety cap: max 50% reduction per position per run
+  auto_after_batch: true             # Auto-trigger rebalance after batch-trade

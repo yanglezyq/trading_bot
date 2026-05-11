@@ -30,7 +30,7 @@ def config_with_api(tmp_db):
         risk=RiskConfig(),
         binance=BinanceConfig(api_key="testkey", api_secret="testsecret"),
         claude=ClaudeConfig(api_key="sk-ant-test"),
-        trading=TradingConfig(max_position_size_pct=0.05),
+        trading=TradingConfig(max_position_size_pct=0.05, combined_ai_calls=False),
         monitor=MonitorConfig(),
         logging=LoggingConfig(sqlite_db=tmp_db),
     )
@@ -107,6 +107,9 @@ class TestUMFuturesNewMethods:
             }]
         }
         client = UMFutures.__new__(UMFutures)
+        client._exchange_info_cache = None
+        client._exchange_info_ts = 0.0
+        client._exchange_info_ttl = 3600.0
         client.query = MagicMock(return_value=fake_info)
         step = client.get_symbol_lot_size("DOGEUSDT")
         assert step == 1.0
@@ -114,6 +117,9 @@ class TestUMFuturesNewMethods:
     def test_get_symbol_lot_size_fallback_on_missing(self):
         from trading.exchange.um_futures import UMFutures
         client = UMFutures.__new__(UMFutures)
+        client._exchange_info_cache = None
+        client._exchange_info_ts = 0.0
+        client._exchange_info_ttl = 3600.0
         client.query = MagicMock(return_value={"symbols": []})
         step = client.get_symbol_lot_size("UNKNOWN")
         assert step == 0.001
@@ -124,6 +130,34 @@ class TestUMFuturesNewMethods:
         client.query = MagicMock(side_effect=RuntimeError("network"))
         step = client.get_symbol_lot_size("BTCUSDT")
         assert step == 0.001
+
+    def test_depth_method_exists(self):
+        from trading.exchange.um_futures import UMFutures
+        assert callable(getattr(UMFutures, "depth", None)), \
+            "depth() must be defined on UMFutures"
+
+    def test_funding_rate_history_method_exists(self):
+        from trading.exchange.um_futures import UMFutures
+        assert callable(getattr(UMFutures, "funding_rate_history", None)), \
+            "funding_rate_history() must be defined on UMFutures"
+
+    def test_depth_calls_correct_endpoint(self):
+        from trading.exchange.um_futures import UMFutures
+        client = UMFutures.__new__(UMFutures)
+        client.query = MagicMock(return_value={"bids": [], "asks": []})
+        result = client.depth(symbol="BTCUSDT", limit=20)
+        client.query.assert_called_once_with(
+            "/fapi/v1/depth", {"symbol": "BTCUSDT", "limit": 20}
+        )
+
+    def test_funding_rate_history_calls_correct_endpoint(self):
+        from trading.exchange.um_futures import UMFutures
+        client = UMFutures.__new__(UMFutures)
+        client.query = MagicMock(return_value=[{"fundingRate": "0.0001"}])
+        result = client.funding_rate_history(symbol="BTCUSDT", limit=3)
+        client.query.assert_called_once_with(
+            "/fapi/v1/fundingRate", {"symbol": "BTCUSDT", "limit": 3}
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

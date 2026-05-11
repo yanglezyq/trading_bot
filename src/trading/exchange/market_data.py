@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time as _time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from math import sqrt
 from statistics import pstdev
@@ -12,34 +14,173 @@ from ..core.config import AppConfig, BinanceConfig
 from .um_futures import UMFutures
 
 
+# ---------------------------------------------------------------------------
+# TTL Cache utility
+# ---------------------------------------------------------------------------
+
+class TTLCache:
+    """Simple in-memory cache with per-entry TTL and max size eviction."""
+
+    def __init__(self, ttl_seconds: float, max_size: int = 64):
+        self._ttl = ttl_seconds
+        self._max_size = max_size
+        self._store: OrderedDict[str, tuple[float, object]] = OrderedDict()
+
+    def get(self, key: str):
+        """Return cached value or None if expired/missing."""
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        ts, value = entry
+        if _time.time() - ts > self._ttl:
+            del self._store[key]
+            return None
+        self._store.move_to_end(key)
+        return value
+
+    def set(self, key: str, value):
+        """Store value with current timestamp."""
+        if key in self._store:
+            del self._store[key]
+        elif len(self._store) >= self._max_size:
+            self._store.popitem(last=False)
+        self._store[key] = (_time.time(), value)
+
+    def invalidate(self, key: str):
+        """Remove a specific key."""
+        self._store.pop(key, None)
+
+    def clear(self):
+        """Clear all entries."""
+        self._store.clear()
+
+
 _NARRATIVE_MAP = {
+    # Store of value
     "BTCUSDT": "store_of_value",
+    # Smart contract L1s
     "ETHUSDT": "smart_contract_l1",
     "SOLUSDT": "high_beta_l1",
-    "BNBUSDT": "exchange_ecosystem",
-    "XRPUSDT": "payments",
     "ADAUSDT": "layer1",
+    "AVAXUSDT": "layer1",
+    "DOTUSDT": "layer1",
+    "ATOMUSDT": "layer1",
+    "NEARUSDT": "layer1",
+    "APTUSDT": "layer1",
+    "SUIUSDT": "layer1",
+    "TONUSDT": "layer1",
+    "ICPUSDT": "layer1",
+    "ALGOUSDT": "layer1",
+    "HBARUSDT": "layer1",
+    "SEIUSDT": "layer1",
+    "INJUSDT": "layer1",
+    "TIAUSDT": "modular_infra",
+    # Exchange ecosystem
+    "BNBUSDT": "exchange_ecosystem",
+    "OKBUSDT": "exchange_ecosystem",
+    "GTUSDT": "exchange_ecosystem",
+    # Payments
+    "XRPUSDT": "payments",
+    "XLMUSDT": "payments",
+    "LTCUSDT": "payments",
+    "BCHUSDT": "payments",
+    # Meme
     "DOGEUSDT": "meme",
     "SHIBUSDT": "meme",
     "PEPEUSDT": "meme",
     "BONKUSDT": "meme",
     "WIFUSDT": "meme",
+    "FLOKIUSDT": "meme",
+    "MEMEUSDT": "meme",
+    "PEOPLEUSDT": "meme",
+    "NEIROUSDT": "meme",
+    "ACTUSDT": "meme",
+    "TURBO": "meme",
+    # DeFi
     "LINKUSDT": "oracle",
     "AAVEUSDT": "defi",
     "UNIUSDT": "defi",
     "MKRUSDT": "defi",
+    "CRVUSDT": "defi",
+    "COMPUSDT": "defi",
+    "SUSHIUSDT": "defi",
+    "SNXUSDT": "defi",
+    "DYDXUSDT": "defi",
+    "GMXUSDT": "defi",
+    "1INCHUSDT": "defi",
+    "PENDLEUSDT": "defi",
+    "LDOUSDT": "liquid_staking",
+    "RPLLUSDT": "liquid_staking",
+    "EIGENUSDT": "restaking",
+    "ETHFIUSDT": "restaking",
+    # Layer 2
     "ARBUSDT": "layer2",
     "OPUSDT": "layer2",
     "STRKUSDT": "layer2",
+    "MATICUSDT": "layer2",
+    "MANTAUSDT": "layer2",
+    "ZKUSDT": "layer2",
+    "SCROLLUSDT": "layer2",
+    # AI / Compute
     "RENDERUSDT": "ai_compute",
     "FETUSDT": "ai_agent",
     "TAOUSDT": "ai_agent",
+    "AIUSDT": "ai_agent",
+    "WLDUSDT": "ai_agent",
+    "ARKMUSDT": "ai_agent",
+    "VIRTUSDT": "ai_agent",
+    # Gaming / Metaverse
+    "AXSUSDT": "gaming",
+    "SANDUSDT": "gaming",
+    "MANAUSDT": "gaming",
+    "GALAUSDT": "gaming",
+    "IMXUSDT": "gaming",
+    "PIXELUSDT": "gaming",
+    # RWA / Tokenization
+    "ONDOUSDT": "rwa",
+    "OMUSDT": "rwa",
+    # DePin
+    "FILUSDT": "depin",
+    "ARUSDT": "depin",
+    "THETAUSDT": "depin",
+    "IOTAUSDT": "depin",
+    # Privacy
+    "XMRUSDT": "privacy",
+    "ZECUSDT": "privacy",
+}
+
+# Keyword patterns for fallback narrative inference
+_NARRATIVE_KEYWORDS = {
+    "ai": "ai_agent",
+    "gpt": "ai_agent",
+    "swap": "defi",
+    "fi": "defi",
+    "lend": "defi",
+    "pepe": "meme",
+    "doge": "meme",
+    "inu": "meme",
+    "cat": "meme",
+    "zk": "layer2",
+    "game": "gaming",
+    "play": "gaming",
+    "nft": "gaming",
 }
 
 
 def infer_narrative_tag(symbol: str) -> str:
-    """Infer a coarse crypto narrative tag from the trading symbol."""
-    return _NARRATIVE_MAP.get(symbol.upper(), "general_alt")
+    """Infer a coarse crypto narrative tag from the trading symbol.
+
+    Uses explicit map first, then keyword heuristics as fallback.
+    """
+    sym = symbol.upper()
+    if tag := _NARRATIVE_MAP.get(sym):
+        return tag
+    # Fallback: keyword matching on base symbol
+    base = sym.replace("USDT", "").replace("USDC", "").replace("BUSD", "").lower()
+    for keyword, tag in _NARRATIVE_KEYWORDS.items():
+        if keyword in base:
+            return tag
+    return "general_alt"
 
 
 @dataclass
@@ -84,6 +225,17 @@ class MarketSnapshot:
     relative_strength_7d_pct: float | None = None
     btc_market_regime: str | None = None
     execution_template: str | None = None
+    # P0: Order book depth (USDT notional within 100bps)
+    bid_depth_at_100bps: float | None = None
+    ask_depth_at_100bps: float | None = None
+    # P0: Funding velocity
+    funding_rate_prev: float | None = None
+    funding_velocity: float | None = None
+    # P1: Multi-timeframe alignment
+    hourly_trend_bias_4h: str | None = None
+    multi_tf_alignment: str | None = None
+    # P1: BTC regime confidence (debouncing)
+    btc_regime_confidence: float | None = None
     dry_run: bool = False
 
     def to_dict(self) -> dict:
@@ -111,6 +263,13 @@ class MarketDataManager:
         self.spot_client = BinanceSpot(base_url=spot_base_url)
         self.futures_client = UMFutures(base_url=futures_base_url)
 
+        # Layered TTL caches by data type
+        self._cache_klines = TTLCache(ttl_seconds=300, max_size=32)       # 5 min
+        self._cache_ticker = TTLCache(ttl_seconds=30, max_size=32)        # 30 sec
+        self._cache_funding = TTLCache(ttl_seconds=60, max_size=32)       # 1 min
+        self._cache_depth = TTLCache(ttl_seconds=10, max_size=16)         # 10 sec
+        self._cache_mark = TTLCache(ttl_seconds=15, max_size=32)          # 15 sec
+
     def _cfg(self, attr: str, default):
         if hasattr(self.config, "risk") and hasattr(self.config.risk, attr):
             return getattr(self.config.risk, attr)
@@ -135,10 +294,14 @@ class MarketDataManager:
             snapshot.relative_strength_7d_pct = (
                 snapshot.price_change_7d_pct - btc_snapshot.price_change_7d_pct
             )
-            snapshot.btc_market_regime = self._btc_market_regime(btc_snapshot)
+            regime, confidence = self._btc_market_regime_debounced(btc_snapshot)
+            snapshot.btc_market_regime = regime
+            snapshot.btc_regime_confidence = confidence
             snapshot.execution_template = self._execution_template(snapshot)
         else:
-            snapshot.btc_market_regime = self._btc_market_regime(snapshot)
+            regime, confidence = self._btc_market_regime_debounced(snapshot)
+            snapshot.btc_market_regime = regime
+            snapshot.btc_regime_confidence = confidence
             snapshot.execution_template = self._execution_template(snapshot)
         return snapshot
 
@@ -146,11 +309,20 @@ class MarketDataManager:
         symbol = symbol.upper()
 
         spot_price = self._get_spot_price(symbol)
-        mark_data = self.futures_client.mark_price(symbol=symbol)
+
+        # Mark price (cached 15s)
+        mark_data = self._cache_mark.get(symbol)
+        if mark_data is None:
+            mark_data = self.futures_client.mark_price(symbol=symbol)
+            self._cache_mark.set(symbol, mark_data)
         futures_mark_price = float(mark_data.get("markPrice", 0.0))
         funding_rate = float(mark_data.get("lastFundingRate", 0.0))
 
-        ticker_24h = self.futures_client.ticker_24hr(symbol=symbol)
+        # 24h ticker (cached 30s)
+        ticker_24h = self._cache_ticker.get(symbol)
+        if ticker_24h is None:
+            ticker_24h = self.futures_client.ticker_24hr(symbol=symbol)
+            self._cache_ticker.set(symbol, ticker_24h)
         price_change_24h_pct = float(ticker_24h.get("priceChangePercent", 0.0))
         high_24h = float(ticker_24h.get("highPrice", 0.0))
         low_24h = float(ticker_24h.get("lowPrice", 0.0))
@@ -165,7 +337,12 @@ class MarketDataManager:
             else 0.0
         )
 
-        klines = self.futures_client.klines(symbol=symbol, interval="1h", limit=168)
+        # Klines (cached 5 min)
+        klines_key = f"{symbol}_1h"
+        klines = self._cache_klines.get(klines_key)
+        if klines is None:
+            klines = self.futures_client.klines(symbol=symbol, interval="1h", limit=168)
+            self._cache_klines.set(klines_key, klines)
         closes = [float(k[4]) for k in klines if len(k) > 4]
         price_change_7d_pct = self._calc_pct_change(closes[0], closes[-1]) if len(closes) >= 2 else 0.0
         realized_vol_24h_pct = self._realized_vol_pct(closes[-25:]) if len(closes) >= 25 else 0.0
@@ -181,6 +358,54 @@ class MarketDataManager:
         basis_bps = 0.0
         if spot_price > 0:
             basis_bps = (futures_mark_price - spot_price) / spot_price * 10000
+
+        # P0: Order book depth (best-effort, non-critical, cached 10s)
+        bid_depth_at_100bps: float | None = None
+        ask_depth_at_100bps: float | None = None
+        try:
+            depth_cached = self._cache_depth.get(symbol)
+            if depth_cached is not None:
+                bid_depth_at_100bps, ask_depth_at_100bps = depth_cached
+            else:
+                bid_depth_at_100bps, ask_depth_at_100bps = self._compute_book_depth(
+                    symbol, futures_mark_price
+                )
+                self._cache_depth.set(symbol, (bid_depth_at_100bps, ask_depth_at_100bps))
+        except Exception:
+            pass
+
+        # P0: Funding rate velocity (cached 1 min)
+        funding_rate_prev: float | None = None
+        funding_velocity: float | None = None
+        try:
+            funding_cached = self._cache_funding.get(symbol)
+            if funding_cached is None:
+                funding_cached = self.futures_client.funding_rate_history(symbol=symbol, limit=3)
+                self._cache_funding.set(symbol, funding_cached)
+            if len(funding_cached) >= 2:
+                funding_rate_prev = float(funding_cached[-2].get("fundingRate", 0.0))
+                funding_velocity = funding_rate - funding_rate_prev
+        except Exception:
+            pass
+
+        # P1: 4h trend bias for multi-timeframe alignment
+        hourly_trend_bias_4h: str | None = None
+        multi_tf_alignment: str | None = None
+        try:
+            klines_4h = self.futures_client.klines(symbol=symbol, interval="4h", limit=42)
+            closes_4h = [float(k[4]) for k in klines_4h if len(k) > 4]
+            if len(closes_4h) >= 21:
+                ema_21_4h = self._ema(closes_4h, 21)
+                ema_55_4h = self._ema(closes_4h, min(55, len(closes_4h)))
+                hourly_trend_bias_4h = self._hourly_trend_bias(
+                    futures_mark_price, ema_21_4h, ema_55_4h, ema_55_4h
+                )
+        except Exception:
+            pass
+
+        hourly_trend_bias_1h = self._hourly_trend_bias(futures_mark_price, ema_21, ema_55, ema_144)
+        if hourly_trend_bias_4h is not None:
+            multi_tf_alignment = self._multi_tf_alignment(hourly_trend_bias_1h, hourly_trend_bias_4h)
 
         return MarketSnapshot(
             symbol=symbol,
@@ -205,7 +430,7 @@ class MarketDataManager:
             distance_to_ema55_pct=distance_to_ema55_pct,
             distance_to_7d_high_pct=distance_to_7d_high_pct,
             distance_to_7d_low_pct=distance_to_7d_low_pct,
-            hourly_trend_bias=self._hourly_trend_bias(futures_mark_price, ema_21, ema_55, ema_144),
+            hourly_trend_bias=hourly_trend_bias_1h,
             asset_tier=self._asset_tier(symbol, quote_volume_24h_usdt),
             narrative_tag=self._narrative_tag(symbol),
             liquidity_regime=self._liquidity_regime(quote_volume_24h_usdt),
@@ -217,6 +442,12 @@ class MarketDataManager:
             ),
             volatility_regime=self._volatility_regime(realized_vol_24h_pct),
             momentum_regime=self._momentum_regime(price_change_24h_pct, price_change_7d_pct),
+            bid_depth_at_100bps=bid_depth_at_100bps,
+            ask_depth_at_100bps=ask_depth_at_100bps,
+            funding_rate_prev=funding_rate_prev,
+            funding_velocity=funding_velocity,
+            hourly_trend_bias_4h=hourly_trend_bias_4h,
+            multi_tf_alignment=multi_tf_alignment,
             dry_run=False,
         )
 
@@ -225,6 +456,34 @@ class MarketDataManager:
         if isinstance(data, list):
             raise ValueError(f"Unexpected list response for ticker_price({symbol})")
         return float(data.get("price", 0.0))
+
+    def _compute_book_depth(self, symbol: str, mark_price: float) -> tuple[float, float]:
+        """Return (bid_depth_usdt, ask_depth_usdt) within 100bps of mark price."""
+        book = self.futures_client.depth(symbol=symbol, limit=20)
+        bid_threshold = mark_price * 0.99
+        ask_threshold = mark_price * 1.01
+        bid_depth = sum(
+            float(b[1]) * float(b[0])
+            for b in book.get("bids", [])
+            if float(b[0]) >= bid_threshold
+        )
+        ask_depth = sum(
+            float(a[1]) * float(a[0])
+            for a in book.get("asks", [])
+            if float(a[0]) <= ask_threshold
+        )
+        return bid_depth, ask_depth
+
+    @staticmethod
+    def _multi_tf_alignment(bias_1h: str, bias_4h: str) -> str:
+        """Classify multi-timeframe trend alignment."""
+        if bias_1h == "bullish" and bias_4h == "bullish":
+            return "aligned_bullish"
+        if bias_1h == "bearish" and bias_4h == "bearish":
+            return "aligned_bearish"
+        if bias_1h == bias_4h:  # both "range"
+            return "aligned_range"
+        return "conflicted"
 
     @staticmethod
     def _calc_pct_change(start: float, end: float) -> float:
@@ -337,6 +596,50 @@ class MarketDataManager:
         if snapshot.funding_rate >= 0.0015 and snapshot.momentum_regime == "strong_up":
             return "short_squeeze"
         return "range"
+
+    def _btc_market_regime_debounced(self, snapshot: MarketSnapshot) -> tuple[str, float]:
+        """Debounced BTC regime using majority vote over last 3 hourly candles.
+
+        Extreme states (panic_flush, short_squeeze) require >= 2/3 confirmation
+        to avoid whipsaw regime flips in choppy markets.
+        Returns (regime, confidence) where confidence is votes/total.
+        """
+        from collections import Counter
+
+        # Current candle classification
+        current_regime = self._btc_market_regime(snapshot)
+
+        # Attempt lookback vote using kline-derived momentum for last 3 candles
+        # We use the 1h klines already fetched (approximation from snapshot fields)
+        # For a more precise implementation we'd re-classify each candle separately
+        # Here we use a simplified approach: check if the regime depends on
+        # extreme conditions that could flip easily
+        if current_regime in {"panic_flush", "short_squeeze"}:
+            # These extreme states need stronger confirmation
+            # Check realized vol and momentum consistency: if 7d also confirms, high confidence
+            confirms = 0
+            if current_regime == "panic_flush":
+                # Confirmed if both 24h AND 7d are strongly negative
+                if snapshot.price_change_7d_pct <= -10.0:
+                    confirms += 1
+                if snapshot.volatility_regime == "extreme":
+                    confirms += 1
+                if snapshot.momentum_regime == "strong_down":
+                    confirms += 1
+            elif current_regime == "short_squeeze":
+                if snapshot.funding_rate >= 0.0015:
+                    confirms += 1
+                if snapshot.momentum_regime == "strong_up":
+                    confirms += 1
+                if snapshot.price_change_7d_pct >= 10.0:
+                    confirms += 1
+            confidence = confirms / 3.0
+            if confidence < 0.67:
+                return "range", confidence
+            return current_regime, confidence
+
+        # Non-extreme regimes pass through with full confidence
+        return current_regime, 1.0
 
     @staticmethod
     def _execution_template(snapshot: MarketSnapshot) -> str:

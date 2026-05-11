@@ -34,6 +34,16 @@ class FuturesPosition:
         """Position notional value in USDT (abs(amount * price))."""
         return abs(self.amount * self.price)
 
+    @property
+    def liquidation_distance_pct(self) -> Optional[float]:
+        """Percentage distance from entry price to liquidation price.
+
+        Returns None if liquidation_price is unavailable or invalid.
+        """
+        if not self.liquidation_price or self.liquidation_price <= 0 or self.price <= 0:
+            return None
+        return abs(self.price - self.liquidation_price) / self.price * 100
+
 
 @dataclass
 class SpotPosition:

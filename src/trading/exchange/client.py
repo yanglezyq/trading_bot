@@ -37,12 +37,14 @@ class BinanceClient:
             api_key=config.api_key,
             api_secret=config.api_secret,
             base_url=spot_base_url,
+            timeout=10,
         )
 
         self.futures_client = BinanceFutures(
             key=config.api_key,
             secret=config.api_secret,
             base_url=futures_base_url,
+            timeout=10,
         )
 
     def get_server_time(self) -> int:

@@ -1,5 +1,6 @@
 """Minimal USDT-M Futures client for binance-connector 3.x (which dropped um_futures)."""
 
+import time as _time
 from typing import Optional
 from binance.api import API
 
@@ -8,7 +9,13 @@ class UMFutures(API):
     """USDT-M Perpetual Futures REST client wrapping the /fapi endpoints."""
 
     def __init__(self, key: Optional[str] = None, secret: Optional[str] = None, base_url: str = "https://fapi.binance.com", **kwargs):
+        # Set default timeout if not provided
+        kwargs.setdefault("timeout", 10)
         super().__init__(api_key=key, api_secret=secret, base_url=base_url, **kwargs)
+        # Exchange info cache (refreshed every hour)
+        self._exchange_info_cache: dict | None = None
+        self._exchange_info_ts: float = 0.0
+        self._exchange_info_ttl: float = 3600.0  # 1 hour
 
     def time(self) -> dict:
         """GET /fapi/v1/time — server time."""
@@ -69,15 +76,22 @@ class UMFutures(API):
         """
         return self.sign_request("GET", "/fapi/v1/positionSide/dual", kwargs)
 
+    def _get_exchange_info_cached(self) -> dict:
+        """Return exchange info with 1-hour cache."""
+        now = _time.time()
+        if self._exchange_info_cache is None or (now - self._exchange_info_ts) > self._exchange_info_ttl:
+            self._exchange_info_cache = self.query("/fapi/v1/exchangeInfo")
+            self._exchange_info_ts = now
+        return self._exchange_info_cache
+
     def get_symbol_lot_size(self, symbol: str) -> float:
-        """Return the LOT_SIZE stepSize for a symbol from /fapi/v1/exchangeInfo.
+        """Return the LOT_SIZE stepSize for a symbol from cached exchangeInfo.
 
         Returns 0.001 as a conservative fallback when the symbol is not found
-        or the API call fails — callers must be aware this may truncate too
-        aggressively or too loosely for some symbols.
+        or the API call fails.
         """
         try:
-            info = self.query("/fapi/v1/exchangeInfo")
+            info = self._get_exchange_info_cached()
             for sym in info.get("symbols", []):
                 if sym.get("symbol") == symbol:
                     for f in sym.get("filters", []):
@@ -86,3 +100,32 @@ class UMFutures(API):
         except Exception:
             pass
         return 0.001
+
+    def get_symbols_lot_sizes(self, symbols: list[str]) -> dict[str, float]:
+        """Batch-fetch LOT_SIZE stepSize for multiple symbols in one API call."""
+        result: dict[str, float] = {}
+        try:
+            info = self._get_exchange_info_cached()
+            symbol_set = set(symbols)
+            for sym in info.get("symbols", []):
+                if sym.get("symbol") in symbol_set:
+                    for f in sym.get("filters", []):
+                        if f.get("filterType") == "LOT_SIZE":
+                            result[sym["symbol"]] = float(f["stepSize"])
+                            break
+        except Exception:
+            pass
+        # Fill defaults for any missing
+        for s in symbols:
+            if s not in result:
+                result[s] = 0.001
+        return result
+
+    def depth(self, symbol: str, limit: int = 20, **kwargs) -> dict:
+        """GET /fapi/v1/depth — order book depth for one symbol."""
+        return self.query("/fapi/v1/depth", {"symbol": symbol, "limit": limit, **kwargs})
+
+    def funding_rate_history(self, symbol: str, limit: int = 3, **kwargs) -> list:
+        """GET /fapi/v1/fundingRate — recent funding rate history for one symbol."""
+        params = {"symbol": symbol, "limit": limit, **kwargs}
+        return self.query("/fapi/v1/fundingRate", params)

@@ -76,6 +76,7 @@ class ClaudeClient:
         user: str,
         max_retries: int = 1,
         cache_system: bool = True,
+        model_override: Optional[str] = None,
     ) -> dict:
         """Call Claude and return parsed JSON; retries once with repair hint on parse failure."""
         client = self._get_client()
@@ -103,7 +104,7 @@ class ClaudeClient:
                 ]
 
             response = client.messages.create(
-                model=self.config.model,
+                model=model_override or self.config.model,
                 max_tokens=self.config.max_tokens,
                 system=system_content,
                 messages=messages,

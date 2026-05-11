@@ -13,6 +13,7 @@ _VALID_STATUSES = frozenset(
         "executed",
         "dry_run",
         "manual_review_required",
+        "auto_execute_blocked",
         "blocked_by_risk",
         "not_executed_missing_api",
         "execution_failed",
@@ -38,6 +39,9 @@ class ResearchDecision:
     invalidation: str
     time_horizon: str
     preferred_market: str  # "spot" | "futures" | "none"
+    supporting_model_count: int = 1
+    consensus_strength: float = 1.0
+    disagreement_note: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "ResearchDecision":
@@ -63,6 +67,9 @@ class ResearchDecision:
             invalidation=str(d.get("invalidation", "")),
             time_horizon=str(d.get("time_horizon", "")),
             preferred_market=preferred_market,
+            supporting_model_count=int(d.get("supporting_model_count", 1) or 1),
+            consensus_strength=float(d.get("consensus_strength", 1.0) or 1.0),
+            disagreement_note=str(d.get("disagreement_note", "")),
         )
 
     def to_dict(self) -> dict:
@@ -131,6 +138,15 @@ class RiskDecision:
     violated_rules: list[str]
     warnings: list[str]
     rationale: str
+    setup_quality_score: Optional[float] = None
+    setup_quality_grade: str = ""
+    gating_profile: str = ""
+    edge_policy_label: str = ""
+    edge_policy_reasons: list[str] = field(default_factory=list)
+    edge_policy_expectancy_pnl_pct: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    opportunity_bucket: str = ""
+    opportunity_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -30,10 +30,13 @@
 
 ## 错误处理
 
-- 外部 API 调用（Binance、Claude）统一用 `try/except Exception as e: raise RuntimeError(f"描述: {e}")`
+- 异常分类：使用 `TransientError`（可重试）和 `PermanentError`（不可重试）
+- 网络/API 调用使用 `@retry(max_attempts=3, base_delay=1.0)` 装饰器
+- 自动识别暂时性异常：ConnectionError, TimeoutError, HTTP 429/503
 - 不吞异常（不写 `except: pass`）
 - CLI 层捕获异常后用 `console.print(f"[red]Error: {e}[/red]")` 显示，并 `raise typer.Exit(1)`
 - 读操作失败返回 `None`，写操作失败抛出异常
+- SL/TP 下单失败：自动重试 1 次，仍失败则 CRITICAL 告警
 
 ## 命名规范
 
@@ -58,9 +61,17 @@
 - 不 mock 外部 API（用 dry_run=True 代替）：避免 mock 与真实行为偏差
 - 新增模块时同步创建 `tests/test_{模块名}.py`
 
+## 缓存规范
+
+- 市场数据使用 `TTLCache` 分层缓存，不同数据类型不同 TTL
+- exchange_info 等元数据使用 1h TTL
+- 缓存 key 为 `"{symbol}_{interval}"` 格式
+- 内部使用 OrderedDict 实现 LRU 淘汰
+
 ## 模块导出规范
 
 新增类/函数后，必须同步更新对应 `__init__.py` 的 `__all__`：
-- `src/trading/core/__init__.py` → core 层新增导出
+- `src/trading/core/__init__.py` → core 层新增导出（含 TransientError, PermanentError, retry）
 - `src/trading/exchange/__init__.py` → exchange 层新增导出
-- `src/trading/ai/__init__.py` → ai 层新增导出（Phase 2）
+- `src/trading/ai/__init__.py` → ai 层新增导出
+- `src/trading/risk/__init__.py` → risk 层新增导出

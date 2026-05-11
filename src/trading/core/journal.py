@@ -24,6 +24,7 @@ class TradeRecord:
     open_time: datetime
     close_time: datetime
     notes: str = ""
+    linked_run_id: Optional[int] = None
     id: Optional[int] = None
 
     @property
@@ -65,6 +66,7 @@ class TradeJournal:
             open_time   TEXT NOT NULL,
             close_time  TEXT NOT NULL,
             notes       TEXT DEFAULT '',
+            linked_run_id INTEGER,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """
@@ -75,6 +77,9 @@ class TradeJournal:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(self._CREATE_TABLE)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(trade_records)").fetchall()}
+            if "linked_run_id" not in cols:
+                conn.execute("ALTER TABLE trade_records ADD COLUMN linked_run_id INTEGER")
             conn.commit()
 
     def record_trade(
@@ -89,6 +94,7 @@ class TradeJournal:
         close_time: Optional[datetime] = None,
         realized_pnl: Optional[float] = None,
         notes: str = "",
+        linked_run_id: Optional[int] = None,
     ) -> TradeRecord:
         """Insert a closed trade; auto-calculates P&L if not provided."""
         close_time = close_time or datetime.now()
@@ -104,12 +110,12 @@ class TradeJournal:
             cur = conn.execute(
                 """INSERT INTO trade_records
                    (symbol, direction, entry_price, exit_price, quantity, leverage,
-                    realized_pnl, pnl_pct, open_time, close_time, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    realized_pnl, pnl_pct, open_time, close_time, notes, linked_run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     symbol.upper(), direction, entry_price, exit_price, quantity, leverage,
                     realized_pnl, pnl_pct,
-                    open_time.isoformat(), close_time.isoformat(), notes,
+                    open_time.isoformat(), close_time.isoformat(), notes, linked_run_id,
                 ),
             )
             conn.commit()
@@ -121,12 +127,13 @@ class TradeJournal:
             quantity=quantity, leverage=leverage,
             realized_pnl=realized_pnl, pnl_pct=pnl_pct,
             open_time=open_time, close_time=close_time, notes=notes,
+            linked_run_id=linked_run_id,
         )
 
     def get_trades(self, symbol: Optional[str] = None, limit: int = 50) -> list[TradeRecord]:
         """Return recent trades, optionally filtered by symbol."""
         sql = "SELECT id, symbol, direction, entry_price, exit_price, quantity, leverage, " \
-              "realized_pnl, pnl_pct, open_time, close_time, notes FROM trade_records"
+              "realized_pnl, pnl_pct, open_time, close_time, notes, linked_run_id FROM trade_records"
         params: list = []
         if symbol:
             sql += " WHERE symbol = ?"
@@ -145,6 +152,7 @@ class TradeJournal:
                 open_time=datetime.fromisoformat(r[9]),
                 close_time=datetime.fromisoformat(r[10]),
                 notes=r[11] or "",
+                linked_run_id=r[12],
             )
             for r in rows
         ]

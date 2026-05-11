@@ -1,24 +1,34 @@
 """End-to-end AI trading execution pipeline."""
 
 import math
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from rich.console import Console
 
 from ..ai.advisor import TradingAdvisor
+from ..ai.adaptive import build_adaptive_prompt_context
 from ..ai.client import ClaudeClient
 from ..ai.schemas import ExecutionPlan, ExecutionResult, ResearchDecision, RiskDecision
 from ..core.config import AppConfig
 from ..core.journal import TradeJournal
+from ..core.retry import retry
 from ..core.vault import VaultReader
 from ..exchange.account import AccountManager
 from ..exchange.client import BinanceClient
 from ..exchange.market_data import MarketDataManager
+from ..exchange.coingecko import CoinGeckoData
+from ..events import EventManager
 from ..exchange.orders import OrderManager
 from ..exchange.positions import PositionManager
+from ..notification import FeishuWebhook
+from ..onchain import OnchainDataManager
 from ..risk.gate import RiskGate
+from ..risk.edge_policy import EdgePolicyAdvisor
+from ..risk.opportunity import OpportunityScorer
 from ..risk.portfolio import PortfolioManager
+from .backtest import BacktestRunner
 from .persistence import TradeRunDB
 
 console = Console()
@@ -59,6 +69,29 @@ def _step_round(quantity: float, step_size: float) -> float:
     return round(floored, precision)
 
 
+@dataclass
+class AnalysisBundle:
+    """Pre-execution analysis payload for one symbol."""
+
+    symbol: str
+    timestamp: str
+    api_configured: bool
+    account_summary: dict
+    all_positions: list[dict]
+    symbol_positions: list[dict]
+    market_snapshot: dict
+    portfolio_snapshot: dict
+    portfolio_budget: dict
+    onchain_snapshot: dict
+    event_snapshot: dict
+    trade_history: list[dict]
+    reflections: list[dict]
+    adaptive_context: dict
+    research: ResearchDecision
+    plan: ExecutionPlan
+    risk: RiskDecision
+
+
 class TradePipeline:
     """Complete AI trading execution pipeline (14 steps)."""
 
@@ -69,14 +102,48 @@ class TradePipeline:
         self.claude = ClaudeClient(config.claude)
         self.advisor = TradingAdvisor(self.claude, config)
         self.risk_gate = RiskGate(config)
+        self.edge_policy = EdgePolicyAdvisor(config)
+        self.opportunity_scorer = OpportunityScorer(config)
         self.portfolio_manager = PortfolioManager(config)
         self.last_market_snapshot: dict = {}
         self.last_portfolio_snapshot: dict = {}
         self.last_portfolio_budget: dict = {}
+        self.last_onchain_snapshot: dict = {}
+        self.last_adaptive_context: dict = {}
+        self.last_edge_policy: dict = {}
+        self.last_walk_forward_summary: dict = {}
+        self._edge_stats_cache: dict[str, dict] = {}
+        self._walk_forward_cache: dict[str, dict] = {}
+        self._live_client: Optional[BinanceClient] = None
+        self.backtest_runner = BacktestRunner(config)
+        # Feishu notification
+        noti = config.notification
+        self._feishu: Optional[FeishuWebhook] = None
+        if noti.enabled and noti.feishu_webhook_url:
+            self._feishu = FeishuWebhook(noti.feishu_webhook_url)
+        # CoinGecko enrichment
+        self._coingecko = CoinGeckoData(cache_ttl_seconds=600.0)
+        # Event sources
+        self._event_manager = EventManager(config.events) if config.events.enabled else None
+        self.last_event_snapshot: dict = {}
+
+    @property
+    def live_client(self) -> BinanceClient:
+        """Lazily create and reuse a single BinanceClient for live API calls."""
+        if self._live_client is None:
+            self._live_client = BinanceClient(self.config.binance, dry_run=False)
+        return self._live_client
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_dict(obj):
+        """Return ``obj.to_dict()`` when available, else pass through dicts unchanged."""
+        if hasattr(obj, "to_dict"):
+            return obj.to_dict()
+        return obj
 
     def run(
         self,
@@ -84,8 +151,21 @@ class TradePipeline:
         market: str = "auto",
         write_vault: bool = True,
         allow_partial: bool = False,
+        auto_execute: bool = False,
     ) -> tuple[ResearchDecision, ExecutionPlan, RiskDecision, ExecutionResult]:
         """Run the full pipeline and return (research, plan, risk, result)."""
+        bundle = self.analyze(symbol)
+        result = self.finalize_analysis(
+            bundle,
+            market=market,
+            write_vault=write_vault,
+            allow_partial=allow_partial,
+            auto_execute=auto_execute,
+        )
+        return bundle.research, bundle.plan, bundle.risk, result
+
+    def analyze(self, symbol: str) -> AnalysisBundle:
+        """Run the analysis stage only and return a reusable bundle."""
         symbol = symbol.upper()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -95,20 +175,39 @@ class TradePipeline:
         all_positions = self._get_positions(api_configured)
         symbol_positions = [p for p in all_positions if p.get("symbol", "").upper() == symbol]
         market_snapshot = self._get_market_snapshot(symbol)
+        # P5: Enrich with CoinGecko market_cap/rank data
+        market_snapshot = self._enrich_with_coingecko(symbol, market_snapshot)
         self.last_market_snapshot = market_snapshot
-        portfolio_snapshot = self.portfolio_manager.build_snapshot(account_summary, all_positions).to_dict()
-        portfolio_budget = self.portfolio_manager.recommend_budget(
+        portfolio_snapshot = self._as_dict(
+            self.portfolio_manager.build_snapshot(account_summary, all_positions)
+        )
+        portfolio_budget = self._as_dict(
+            self.portfolio_manager.recommend_budget(
             symbol=symbol,
             market_snapshot=market_snapshot,
             positions=all_positions,
             account_summary=account_summary,
-        ).to_dict()
+        ))
         self.last_portfolio_snapshot = portfolio_snapshot
         self.last_portfolio_budget = portfolio_budget
+
+        console.print(f"[cyan]Step 4.5/14  Fetching on-chain data for {symbol}…[/cyan]")
+        onchain_snapshot = self._get_onchain_snapshot(symbol)
+        self.last_onchain_snapshot = onchain_snapshot
+
+        console.print(f"[cyan]Step 4.6/14  Fetching upcoming events for {symbol}…[/cyan]")
+        event_snapshot = self._get_event_snapshot(symbol)
+        self.last_event_snapshot = event_snapshot
 
         vault_context = self._get_vault_context(symbol)
         trade_history = self._get_trade_history(symbol)
         reflections = self._get_reflections(symbol)
+        adaptive_context = self._get_adaptive_context(
+            symbol=symbol,
+            trade_history=trade_history,
+            reflections=reflections,
+        )
+        self.last_adaptive_context = adaptive_context
 
         if not self.claude.is_configured:
             raise RuntimeError(
@@ -116,25 +215,74 @@ class TradePipeline:
                 "Cannot generate research decision."
             )
 
-        console.print(f"[cyan]Step 7/14  Generating ResearchDecision for {symbol}…[/cyan]")
-        research = self.advisor.generate_research(
-            symbol=symbol,
-            account_summary=account_summary,
-            positions=symbol_positions,
-            market_snapshot=market_snapshot,
-            vault_context=vault_context,
-            trade_history=trade_history,
-            reflections=reflections,
-        )
+        if self.config.claude.ensemble_enabled:
+            console.print(f"[cyan]Step 7/14  Generating ensemble ResearchDecision for {symbol}…[/cyan]")
+            research = self.advisor.generate_research_ensemble(
+                symbol=symbol,
+                account_summary=account_summary,
+                positions=symbol_positions,
+                market_snapshot=market_snapshot,
+                onchain_snapshot=onchain_snapshot,
+                vault_context=vault_context,
+                trade_history=trade_history,
+                reflections=reflections,
+                portfolio_snapshot=portfolio_snapshot,
+                portfolio_budget=portfolio_budget,
+                event_snapshot=event_snapshot,
+                adaptive_context=adaptive_context,
+            )
 
-        console.print(f"[cyan]Step 8/14  Generating ExecutionPlan for {symbol}…[/cyan]")
-        plan = self.advisor.generate_execution_plan(
-            symbol=symbol,
-            research=research,
-            account_summary=account_summary,
-            positions=symbol_positions,
-            market_snapshot=market_snapshot,
-        )
+            console.print(f"[cyan]Step 8/14  Generating ExecutionPlan for {symbol}…[/cyan]")
+            plan = self.advisor.generate_execution_plan(
+                symbol=symbol,
+                research=research,
+                account_summary=account_summary,
+                positions=symbol_positions,
+                market_snapshot=market_snapshot,
+                adaptive_context=adaptive_context,
+            )
+        elif self.config.trading.combined_ai_calls:
+            console.print(f"[cyan]Step 7-8/14  Generating combined Research+Execution for {symbol}…[/cyan]")
+            research, plan = self.advisor.generate_combined(
+                symbol=symbol,
+                account_summary=account_summary,
+                positions=symbol_positions,
+                market_snapshot=market_snapshot,
+                vault_context=vault_context,
+                trade_history=trade_history,
+                reflections=reflections,
+                onchain_snapshot=onchain_snapshot,
+                portfolio_snapshot=portfolio_snapshot,
+                portfolio_budget=portfolio_budget,
+                event_snapshot=event_snapshot,
+                adaptive_context=adaptive_context,
+            )
+        else:
+            console.print(f"[cyan]Step 7/14  Generating ResearchDecision for {symbol}…[/cyan]")
+            research = self.advisor.generate_research(
+                symbol=symbol,
+                account_summary=account_summary,
+                positions=symbol_positions,
+                market_snapshot=market_snapshot,
+                onchain_snapshot=onchain_snapshot,
+                vault_context=vault_context,
+                trade_history=trade_history,
+                reflections=reflections,
+                portfolio_snapshot=portfolio_snapshot,
+                portfolio_budget=portfolio_budget,
+                event_snapshot=event_snapshot,
+                adaptive_context=adaptive_context,
+            )
+
+            console.print(f"[cyan]Step 8/14  Generating ExecutionPlan for {symbol}…[/cyan]")
+            plan = self.advisor.generate_execution_plan(
+                symbol=symbol,
+                research=research,
+                account_summary=account_summary,
+                positions=symbol_positions,
+                market_snapshot=market_snapshot,
+                adaptive_context=adaptive_context,
+            )
 
         console.print("[cyan]Step 9/14  Running risk gate…[/cyan]")
         risk = self.risk_gate.evaluate(
@@ -144,53 +292,124 @@ class TradePipeline:
             market_snapshot=market_snapshot,
             portfolio_snapshot=portfolio_snapshot,
             portfolio_budget=portfolio_budget,
+            research_decision=research.to_dict(),
+            recent_trade_history=trade_history,
+            event_snapshot=event_snapshot,
         )
-
-        console.print("[cyan]Step 10–11  Executing action…[/cyan]")
-        result = self._execute(
+        risk = self._apply_edge_policy_overlay(
             symbol=symbol,
-            market=market,
             plan=plan,
             risk=risk,
+            market_snapshot=market_snapshot,
+        )
+        risk = self._apply_opportunity_score(
+            research=research,
+            plan=plan,
+            risk=risk,
+        )
+        return AnalysisBundle(
+            symbol=symbol,
+            timestamp=timestamp,
             api_configured=api_configured,
             account_summary=account_summary,
-            positions=symbol_positions,
+            all_positions=all_positions,
+            symbol_positions=symbol_positions,
+            market_snapshot=market_snapshot,
+            portfolio_snapshot=portfolio_snapshot,
+            portfolio_budget=portfolio_budget,
+            onchain_snapshot=onchain_snapshot,
+            event_snapshot=event_snapshot,
+            trade_history=trade_history,
+            reflections=reflections,
+            adaptive_context=adaptive_context,
+            research=research,
+            plan=plan,
+            risk=risk,
+        )
+
+    def finalize_analysis(
+        self,
+        bundle: AnalysisBundle,
+        *,
+        market: str = "auto",
+        write_vault: bool = True,
+        allow_partial: bool = False,
+        auto_execute: bool = False,
+    ) -> ExecutionResult:
+        """Execute, persist, and notify for an already analyzed symbol."""
+        console.print("[cyan]Step 10–11  Executing action…[/cyan]")
+        result = self._execute(
+            symbol=bundle.symbol,
+            market=market,
+            research=bundle.research,
+            plan=bundle.plan,
+            risk=bundle.risk,
+            api_configured=bundle.api_configured,
+            account_summary=bundle.account_summary,
+            positions=bundle.symbol_positions,
             allow_partial=allow_partial,
+            auto_execute=auto_execute,
         )
 
         report_path: Optional[str] = None
         if write_vault:
             report_path = self._write_vault_report(
-                symbol=symbol,
-                timestamp=timestamp,
-                account_summary=account_summary,
-                market_snapshot=market_snapshot,
-                positions=symbol_positions,
-                research=research,
-                plan=plan,
-                risk=risk,
+                symbol=bundle.symbol,
+                timestamp=bundle.timestamp,
+                account_summary=bundle.account_summary,
+                market_snapshot=bundle.market_snapshot,
+                onchain_snapshot=bundle.onchain_snapshot,
+                positions=bundle.symbol_positions,
+                research=bundle.research,
+                plan=bundle.plan,
+                risk=bundle.risk,
                 result=result,
-                reflections=reflections,
-                portfolio_snapshot=portfolio_snapshot,
-                portfolio_budget=portfolio_budget,
+                reflections=bundle.reflections,
+                portfolio_snapshot=bundle.portfolio_snapshot,
+                portfolio_budget=bundle.portfolio_budget,
+                adaptive_context=bundle.adaptive_context,
             )
 
         console.print("[cyan]Step 12  Persisting run to SQLite…[/cyan]")
         self.db.save_run(
-            symbol=symbol,
+            symbol=bundle.symbol,
             model=self.config.claude.model,
-            research_decision=research,
-            execution_plan=plan,
-            risk_decision=risk,
+            research_decision=bundle.research,
+            execution_plan=bundle.plan,
+            risk_decision=bundle.risk,
             execution_result=result,
-            account_snapshot=account_summary,
-            market_snapshot=market_snapshot,
-            position_snapshot=symbol_positions,
+            account_snapshot=bundle.account_summary,
+            market_snapshot=bundle.market_snapshot,
+            adaptive_context=bundle.adaptive_context,
+            onchain_snapshot=bundle.onchain_snapshot,
+            position_snapshot=bundle.symbol_positions,
             dry_run=self.dry_run,
             report_path=report_path,
         )
 
-        return research, plan, risk, result
+        if self._feishu and self.config.notification.on_pipeline_complete:
+            entry_price = 0.0
+            sl_price = 0.0
+            tp_price = 0.0
+            if result.manual_order_details:
+                entry_price = float(result.manual_order_details.get("mark_price", 0))
+                sl_price = float(result.manual_order_details.get("stop_loss_price", 0))
+                tp_price = float(result.manual_order_details.get("take_profit_price", 0))
+            self._feishu.notify_pipeline_complete(
+                symbol=bundle.symbol,
+                stance=bundle.research.stance,
+                confidence=bundle.research.confidence,
+                action=bundle.plan.action,
+                size_pct=bundle.plan.size_pct,
+                leverage=bundle.plan.leverage,
+                risk_approved=bundle.risk.approved,
+                risk_rationale=bundle.risk.rationale,
+                entry_price=entry_price,
+                stop_loss_price=sl_price,
+                take_profit_price=tp_price,
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # Data-gathering helpers
@@ -208,8 +427,7 @@ class TradePipeline:
                 "dry_run": True,
             }
         try:
-            binance = BinanceClient(self.config.binance, dry_run=False)
-            return AccountManager(binance).get_account_summary()
+            return self._fetch_account_summary()
         except Exception as exc:
             console.print(f"[yellow]Warning: account fetch failed ({exc}), using mock data.[/yellow]")
             return {
@@ -223,27 +441,34 @@ class TradePipeline:
                 "error": str(exc),
             }
 
+    @retry(max_attempts=3, base_delay=1.0)
+    def _fetch_account_summary(self) -> dict:
+        return AccountManager(self.live_client).get_account_summary()
+
     def _get_positions(self, api_configured: bool) -> list[dict]:
         if not api_configured or self.dry_run:
             return []
         try:
-            binance = BinanceClient(self.config.binance, dry_run=False)
-            futures = PositionManager(binance).get_futures_positions()
-            return [
-                {
-                    "symbol": p.symbol,
-                    "direction": "LONG" if p.is_long else "SHORT",
-                    "amount": p.amount,
-                    "price": p.price,
-                    "leverage": p.leverage,
-                    "unrealized_pnl": p.unrealized_pnl,
-                    "unrealized_pnl_pct": p.unrealized_pnl_pct,
-                }
-                for p in futures
-            ]
+            return self._fetch_positions()
         except Exception as exc:
             console.print(f"[yellow]Warning: positions fetch failed ({exc}).[/yellow]")
             return []
+
+    @retry(max_attempts=3, base_delay=1.0)
+    def _fetch_positions(self) -> list[dict]:
+        futures = PositionManager(self.live_client).get_futures_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "direction": "LONG" if p.is_long else "SHORT",
+                "amount": p.amount,
+                "price": p.price,
+                "leverage": p.leverage,
+                "unrealized_pnl": p.unrealized_pnl,
+                "unrealized_pnl_pct": p.unrealized_pnl_pct,
+            }
+            for p in futures
+        ]
 
     def _get_vault_context(self, symbol: str) -> str:
         try:
@@ -260,6 +485,51 @@ class TradePipeline:
         except Exception as exc:
             console.print(f"[yellow]Warning: market snapshot unavailable ({exc}).[/yellow]")
             return {"symbol": symbol.upper(), "error": str(exc)}
+
+    def _enrich_with_coingecko(self, symbol: str, snapshot: dict) -> dict:
+        """Enrich market snapshot with CoinGecko market_cap/rank (non-blocking)."""
+        try:
+            return self._coingecko.enrich_market_snapshot(symbol, snapshot)
+        except Exception as exc:
+            console.print(f"[yellow]Warning: CoinGecko enrichment skipped ({exc}).[/yellow]")
+            return snapshot
+
+    def _get_event_snapshot(self, symbol: str) -> dict:
+        """Fetch upcoming macro/token-unlock events for the symbol (never raises)."""
+        if not self._event_manager:
+            return {"has_high_impact_soon": False, "has_major_unlock_soon": False}
+        try:
+            snap = self._event_manager.get_upcoming_events(symbol)
+            if snap.has_high_impact_soon or snap.has_major_unlock_soon:
+                flags = []
+                if snap.has_high_impact_soon:
+                    flags.append("high-impact macro")
+                if snap.has_major_unlock_soon:
+                    flags.append("major token unlock")
+                console.print(f"[yellow]⚠ Events: {', '.join(flags)} upcoming[/yellow]")
+            else:
+                console.print(f"[dim]Events: no significant upcoming events for {symbol}[/dim]")
+            return snap.to_dict()
+        except Exception as exc:
+            console.print(f"[yellow]Warning: event data unavailable ({exc}).[/yellow]")
+            return {"has_high_impact_soon": False, "has_major_unlock_soon": False}
+
+    def _get_onchain_snapshot(self, symbol: str) -> dict:
+        if self.dry_run:
+            return {"symbol": symbol.upper(), "has_onchain_data": False, "dry_run": True}
+        try:
+            mgr = OnchainDataManager()
+            snap = mgr.get_snapshot(symbol)
+            if snap.has_onchain_data:
+                console.print(
+                    f"[green]✓ On-chain data: {', '.join(snap.data_sources)}[/green]"
+                )
+            else:
+                console.print(f"[dim]On-chain: no data available for {symbol}[/dim]")
+            return snap.to_dict()
+        except Exception as exc:
+            console.print(f"[yellow]Warning: on-chain data unavailable ({exc}).[/yellow]")
+            return {"symbol": symbol.upper(), "has_onchain_data": False}
 
     def _get_trade_history(self, symbol: str) -> list[dict]:
         try:
@@ -292,6 +562,195 @@ class TradePipeline:
         except Exception:
             return []
 
+    def _get_adaptive_context(
+        self,
+        symbol: str,
+        trade_history: list[dict],
+        reflections: list[dict],
+    ) -> dict:
+        """Build prompt adaptation guidance from realized outcomes and past reflections."""
+        if not self.config.claude.adaptive_prompt_enabled:
+            return {"enabled": False, "reason": "disabled"}
+
+        try:
+            journal = TradeJournal(self.config.logging.sqlite_db)
+            symbol_summary = journal.get_summary(symbol=symbol)
+            global_summary = journal.get_summary()
+            recent_symbol_records = journal.get_trades(
+                symbol=symbol,
+                limit=self.config.claude.adaptive_prompt_lookback_trades,
+            )
+            recent_symbol_trades = [
+                {
+                    "symbol": rec.symbol,
+                    "direction": rec.direction,
+                    "realized_pnl": rec.realized_pnl,
+                    "pnl_pct": rec.pnl_pct,
+                    "linked_run_id": rec.linked_run_id,
+                }
+                for rec in recent_symbol_records
+            ]
+            risk_stats = self.db.get_risk_rule_stats(
+                symbol=symbol,
+                limit=self.config.claude.adaptive_prompt_lookback_runs,
+            )
+            return build_adaptive_prompt_context(
+                symbol=symbol,
+                symbol_summary=symbol_summary,
+                global_summary=global_summary,
+                recent_symbol_trades=recent_symbol_trades or trade_history,
+                reflections=reflections,
+                risk_stats=risk_stats,
+                min_trades=self.config.claude.adaptive_prompt_min_trades,
+                loss_streak_threshold=self.config.claude.adaptive_prompt_loss_streak_threshold,
+            )
+        except Exception:
+            return {"enabled": False, "reason": "unavailable"}
+
+    def _apply_edge_policy_overlay(
+        self,
+        *,
+        symbol: str,
+        plan: ExecutionPlan,
+        risk: RiskDecision,
+        market_snapshot: dict,
+    ) -> RiskDecision:
+        """Overlay replay-derived edge policy on top of the current risk decision."""
+        if not self.config.trading.edge_policy_enabled:
+            self.last_edge_policy = {"label": "disabled"}
+            return risk
+
+        try:
+            cache_key = (
+                f"global::{self.config.claude.adaptive_prompt_lookback_runs}::"
+                f"{self.config.trading.edge_policy_min_samples}"
+            )
+            edge_stats = self._edge_stats_cache.get(cache_key)
+            if edge_stats is None:
+                edge_stats = self.db.get_edge_stats(
+                    symbol=None,
+                    limit=self.config.claude.adaptive_prompt_lookback_runs,
+                    min_samples=self.config.trading.edge_policy_min_samples,
+                )
+                self._edge_stats_cache[cache_key] = edge_stats
+            wf_summary = self._get_walk_forward_summary(symbol)
+            decision = self.edge_policy.evaluate(
+                market_snapshot=market_snapshot,
+                risk_decision=risk.to_dict(),
+                edge_stats=edge_stats,
+                walk_forward_summary=wf_summary,
+            )
+            self.last_edge_policy = decision.to_dict()
+        except Exception as exc:
+            self.last_edge_policy = {"label": "unavailable", "reason": str(exc)}
+            return risk
+
+        reasons = list(risk.warnings)
+        if decision.reasons:
+            reasons.extend([f"[edge_policy] {reason}" for reason in decision.reasons])
+
+        if decision.label in {"blocked", "denylist_blocked"}:
+            return RiskDecision(
+                approved=False,
+                adjusted_action="hold",
+                adjusted_size_pct=0.0,
+                adjusted_leverage=risk.adjusted_leverage,
+                violated_rules=list(risk.violated_rules)
+                + [f"edge policy blocked current slice for {symbol}"],
+                warnings=reasons,
+                rationale=f"{risk.rationale} | Edge policy blocked current slice.",
+                setup_quality_score=risk.setup_quality_score,
+                setup_quality_grade=risk.setup_quality_grade,
+                gating_profile=risk.gating_profile,
+                edge_policy_label=decision.label,
+                edge_policy_reasons=decision.reasons,
+                edge_policy_expectancy_pnl_pct=decision.expectancy_pnl_pct,
+            )
+
+        adjusted_size = risk.adjusted_size_pct
+        rationale = risk.rationale
+        if decision.label in {"promoted", "allowlist_promoted"} and adjusted_size is not None and adjusted_size > 0:
+            boosted = adjusted_size * decision.size_multiplier
+            global_cap = self.config.trading.max_position_size_pct * 100
+            adjusted_size = min(boosted, global_cap)
+            rationale = (
+                f"{risk.rationale} | Edge policy promoted current slice; "
+                f"size boosted to {adjusted_size:.1f}%."
+            )
+
+        return RiskDecision(
+            approved=risk.approved,
+            adjusted_action=risk.adjusted_action,
+            adjusted_size_pct=adjusted_size,
+            adjusted_leverage=risk.adjusted_leverage,
+            violated_rules=list(risk.violated_rules),
+            warnings=reasons,
+            rationale=rationale,
+            setup_quality_score=risk.setup_quality_score,
+            setup_quality_grade=risk.setup_quality_grade,
+            gating_profile=risk.gating_profile,
+            edge_policy_label=decision.label,
+            edge_policy_reasons=decision.reasons,
+            edge_policy_expectancy_pnl_pct=decision.expectancy_pnl_pct,
+        )
+
+    def _get_walk_forward_summary(self, symbol: str) -> dict:
+        """Return cached walk-forward summary for symbol when available."""
+        if symbol in self._walk_forward_cache:
+            summary = self._walk_forward_cache[symbol]
+            self.last_walk_forward_summary = summary
+            return summary
+        try:
+            windows = self.backtest_runner.walk_forward(
+                symbol=symbol,
+                limit=max(self.config.claude.adaptive_prompt_lookback_runs, 25),
+                default_hours=48,
+                train_size=20,
+                test_size=5,
+                step=5,
+            )
+            summary = self.backtest_runner.summarize_walk_forward(windows)
+        except Exception as exc:
+            summary = {"windows": 0, "error": str(exc)}
+        self._walk_forward_cache[symbol] = summary
+        self.last_walk_forward_summary = summary
+        return summary
+
+    def _apply_opportunity_score(
+        self,
+        *,
+        research: ResearchDecision,
+        plan: ExecutionPlan,
+        risk: RiskDecision,
+    ) -> RiskDecision:
+        """Attach unified opportunity score after edge/risk overlays."""
+        if not self.config.trading.opportunity_score_enabled:
+            return risk
+        decision = self.opportunity_scorer.evaluate(
+            research=research,
+            plan=plan,
+            risk=risk,
+        )
+        reasons = list(risk.edge_policy_reasons) + [f"[opportunity] {r}" for r in decision.reasons[:4]]
+        return RiskDecision(
+            approved=risk.approved,
+            adjusted_action=risk.adjusted_action,
+            adjusted_size_pct=risk.adjusted_size_pct,
+            adjusted_leverage=risk.adjusted_leverage,
+            violated_rules=list(risk.violated_rules),
+            warnings=list(risk.warnings),
+            rationale=risk.rationale,
+            setup_quality_score=risk.setup_quality_score,
+            setup_quality_grade=risk.setup_quality_grade,
+            gating_profile=risk.gating_profile,
+            edge_policy_label=risk.edge_policy_label,
+            edge_policy_reasons=reasons,
+            edge_policy_expectancy_pnl_pct=risk.edge_policy_expectancy_pnl_pct,
+            opportunity_score=decision.score,
+            opportunity_bucket=decision.bucket,
+            opportunity_reasons=decision.reasons,
+        )
+
     # ------------------------------------------------------------------
     # Execution logic
     # ------------------------------------------------------------------
@@ -300,12 +759,14 @@ class TradePipeline:
         self,
         symbol: str,
         market: str,
+        research: ResearchDecision,
         plan: ExecutionPlan,
         risk: RiskDecision,
         api_configured: bool,
         account_summary: dict,
         positions: list[dict],
         allow_partial: bool,
+        auto_execute: bool,
     ) -> ExecutionResult:
         final_action = risk.adjusted_action or plan.action
         final_size_pct = (
@@ -428,6 +889,46 @@ class TradePipeline:
             positions=positions,
             api_configured=api_configured,
         )
+        auto_exec_enabled = self._is_auto_execute_requested(auto_execute=auto_execute)
+        auto_allowed, auto_reason = self._evaluate_auto_execute_guardrails(
+            symbol=symbol,
+            market=market,
+            research=research,
+            risk=risk,
+            final_action=final_action,
+            manual_ticket=manual_ticket,
+        )
+        if auto_exec_enabled and auto_allowed:
+            executed = self._do_execute(
+                symbol=symbol,
+                market=market,
+                final_action=final_action,
+                final_size_pct=final_size_pct,
+                final_leverage=final_leverage,
+                plan=plan,
+                account_summary=account_summary,
+                positions=positions,
+            )
+            executed.manual_order_details = manual_ticket
+            executed.execution_reason = (
+                "自动执行已开启，且通过自动执行安全闸门。"
+                f" 计划理由：{plan.rationale} | 风控结论：{risk.rationale}"
+            )
+            return executed
+        if auto_exec_enabled and not auto_allowed:
+            return ExecutionResult(
+                executed=False,
+                status="auto_execute_blocked",
+                symbol=symbol,
+                final_action=final_action,
+                final_size_pct=final_size_pct,
+                final_leverage=final_leverage,
+                message="自动执行未通过安全闸门，已降级为手动复核。",
+                order_ids=[],
+                exchange="binance",
+                manual_order_details=manual_ticket,
+                execution_reason=auto_reason,
+            )
         return ExecutionResult(
             executed=False,
             status="manual_review_required",
@@ -444,6 +945,147 @@ class TradePipeline:
                 f" 计划理由：{plan.rationale} | 风控结论：{risk.rationale}"
             ),
         )
+
+    def _is_auto_execute_requested(self, auto_execute: bool) -> bool:
+        """Return True when live auto execution is explicitly enabled for this run."""
+        if auto_execute:
+            return True
+        return bool(
+            self.config.trading.auto_execute_enabled
+            and not self.config.trading.auto_execute_require_cli_flag
+        )
+
+    def _evaluate_auto_execute_guardrails(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        research: ResearchDecision,
+        risk: RiskDecision,
+        final_action: str,
+        manual_ticket: Optional[dict],
+    ) -> tuple[bool, str]:
+        """Evaluate extra guardrails required before live auto execution."""
+        tc = self.config.trading
+        if manual_ticket is None:
+            return False, "自动执行需要可用的下单明细，但当前未能生成 manual ticket。"
+
+        resolved_market = self._infer_market(market, final_action)
+        allowed_markets = {m.lower() for m in tc.auto_execute_allowed_markets}
+        if allowed_markets and resolved_market not in allowed_markets:
+            return False, f"自动执行仅允许 {sorted(allowed_markets)}，当前市场为 {resolved_market}。"
+
+        if tc.auto_execute_kill_switch:
+            return False, "auto_execute_kill_switch 已开启，自动执行被全局暂停。"
+
+        if not self.config.is_testnet and not tc.auto_execute_live_enabled:
+            return False, "真实环境自动执行未开启；请显式设置 auto_execute_live_enabled=true。"
+
+        if final_action in _CLOSE_ACTIONS:
+            return True, "风险降低型动作允许自动执行。"
+
+        allowed_symbols = {s.upper() for s in tc.auto_execute_allowed_symbols}
+        if allowed_symbols and symbol.upper() not in allowed_symbols:
+            return False, f"{symbol} 不在 auto_execute_allowed_symbols 白名单中。"
+
+        if tc.auto_execute_block_on_open_orders:
+            try:
+                open_orders = OrderManager(self.live_client).get_open_orders(symbol=symbol)
+            except Exception as exc:
+                return False, f"无法验证 {symbol} 是否存在未完成订单：{exc}"
+            if open_orders:
+                return False, f"{symbol} 当前存在 {len(open_orders)} 笔未完成订单，自动执行已阻止。"
+
+        if research.confidence < tc.auto_execute_min_confidence:
+            return False, (
+                f"research confidence {research.confidence:.0%} < auto threshold "
+                f"{tc.auto_execute_min_confidence:.0%}。"
+            )
+
+        if research.supporting_model_count > 1 and research.consensus_strength < tc.auto_execute_min_consensus_strength:
+            return False, (
+                f"consensus {research.consensus_strength:.0%} < auto threshold "
+                f"{tc.auto_execute_min_consensus_strength:.0%}。"
+            )
+
+        if risk.setup_quality_score is not None and risk.setup_quality_score < tc.auto_execute_min_quality_score:
+            return False, (
+                f"setup quality {risk.setup_quality_score:.1f} < auto threshold "
+                f"{tc.auto_execute_min_quality_score:.1f}。"
+            )
+
+        if (
+            tc.opportunity_score_min_auto_execute > 0
+            and risk.opportunity_score is not None
+            and risk.opportunity_score < tc.opportunity_score_min_auto_execute
+        ):
+            return False, (
+                f"opportunity score {risk.opportunity_score:.1f} < auto threshold "
+                f"{tc.opportunity_score_min_auto_execute:.1f}。"
+            )
+
+        if len(risk.warnings) > tc.auto_execute_max_warning_count:
+            return False, (
+                f"risk warnings count {len(risk.warnings)} > auto max "
+                f"{tc.auto_execute_max_warning_count}。"
+            )
+
+        allowed_edge_labels = {str(x) for x in tc.auto_execute_allowed_edge_labels}
+        if allowed_edge_labels and (risk.edge_policy_label or "") not in allowed_edge_labels:
+            return False, (
+                f"edge policy label {(risk.edge_policy_label or 'unknown')} "
+                f"不在 auto_execute_allowed_edge_labels 中。"
+            )
+
+        if (
+            tc.auto_execute_min_edge_expectancy_pnl_pct > 0
+            and risk.edge_policy_expectancy_pnl_pct is not None
+            and risk.edge_policy_expectancy_pnl_pct < tc.auto_execute_min_edge_expectancy_pnl_pct
+        ):
+            return False, (
+                f"edge expectancy {risk.edge_policy_expectancy_pnl_pct:+.2f}% < auto threshold "
+                f"{tc.auto_execute_min_edge_expectancy_pnl_pct:+.2f}%。"
+            )
+
+        if not allowed_edge_labels and (risk.edge_policy_label or "") in {"blocked", "denylist_blocked"}:
+            return False, f"edge policy label {(risk.edge_policy_label or 'unknown')} 已被判定为负 edge。"
+
+        if tc.auto_execute_require_sl_tp and (
+            not manual_ticket.get("stop_loss_price") or not manual_ticket.get("take_profit_price")
+        ):
+            return False, "自动执行要求同时具备止损和止盈价格。"
+
+        if tc.auto_execute_require_entry_zone_match and manual_ticket.get("entry_validity") == "outside_entry_zone":
+            return False, "当前价格已脱离建议入场区，自动执行已阻止。"
+
+        if tc.auto_execute_symbol_cooldown_minutes > 0:
+            recent_symbol_exec = self.db.count_recent_executed_runs(
+                within_seconds=tc.auto_execute_symbol_cooldown_minutes * 60,
+                symbol=symbol,
+            )
+            if recent_symbol_exec > 0:
+                return False, (
+                    f"{symbol} 在最近 {tc.auto_execute_symbol_cooldown_minutes} 分钟内已有自动执行记录，进入冷却。"
+                )
+
+        if tc.auto_execute_max_daily_orders > 0:
+            recent_day_exec = self.db.count_recent_executed_runs(within_seconds=24 * 60 * 60)
+            if recent_day_exec >= tc.auto_execute_max_daily_orders:
+                return False, (
+                    f"最近 24 小时自动执行次数 {recent_day_exec} 已达上限 "
+                    f"{tc.auto_execute_max_daily_orders}。"
+                )
+
+        if tc.auto_execute_max_daily_notional_usdt > 0:
+            recent_day_notional = self.db.sum_recent_executed_notional_usdt(within_seconds=24 * 60 * 60)
+            current_notional = float(manual_ticket.get("notional_usdt", 0.0) or 0.0)
+            if recent_day_notional + current_notional > tc.auto_execute_max_daily_notional_usdt:
+                return False, (
+                    f"最近 24 小时累计自动执行名义金额 ${recent_day_notional:,.0f}，"
+                    f"本次再执行将超过上限 ${tc.auto_execute_max_daily_notional_usdt:,.0f}。"
+                )
+
+        return True, "通过自动执行安全闸门。"
 
     # ------------------------------------------------------------------
     # Manual order preparation / Real order execution
@@ -520,13 +1162,12 @@ class TradePipeline:
         effective_reduce_only = reduce_only
 
         if require_live_data:
-            binance = BinanceClient(self.config.binance, dry_run=False)
             if resolved_market == "spot":
-                mark_price = self._get_spot_price(binance, symbol)
+                mark_price = self._get_spot_price(self.live_client, symbol)
             else:
-                mark_price = self._get_mark_price(binance, symbol)
-                step_size = binance.futures_client.get_symbol_lot_size(symbol)
-                is_hedge = self._get_position_mode(binance)
+                mark_price = self._get_mark_price(self.live_client, symbol)
+                step_size = self.live_client.futures_client.get_symbol_lot_size(symbol)
+                is_hedge = self._get_position_mode(self.live_client)
                 position_side = _ACTION_TO_POSITION_SIDE.get(final_action) if is_hedge else None
                 effective_reduce_only = reduce_only and not is_hedge
         else:
@@ -617,6 +1258,42 @@ class TradePipeline:
             "entry_idea": plan.entry_idea,
             "rationale": plan.rationale,
         }
+
+        # P1: Trailing stop suggestion
+        if not reduce_only and mark_price > 0:
+            activation_pct = self.config.trading.trailing_stop_activation_pct
+            trail_dist_pct = self.config.trading.trailing_stop_distance_pct
+            if side == "BUY":
+                activation_price = round(mark_price * (1 + activation_pct / 100), 4)
+            else:
+                activation_price = round(mark_price * (1 - activation_pct / 100), 4)
+            ticket["trailing_stop_suggestion"] = {
+                "activation_price": activation_price,
+                "activation_pct": activation_pct,
+                "trailing_distance_pct": trail_dist_pct,
+                "note": f"浮盈{activation_pct}%后激活，回撤{trail_dist_pct}%触发",
+            }
+
+        # P1: Staged take-profit plan
+        if not reduce_only and mark_price > 0:
+            staged_levels = self.config.trading.staged_tp_levels
+            staged_tp_plan = []
+            for level in staged_levels:
+                pct = float(level.get("pct", 0))
+                close_pct = float(level.get("close_pct", 0))
+                if pct > 0 and close_pct > 0:
+                    if side == "BUY":
+                        target = round(mark_price * (1 + pct / 100), 4)
+                    else:
+                        target = round(mark_price * (1 - pct / 100), 4)
+                    staged_tp_plan.append({
+                        "target_price": target,
+                        "close_pct": close_pct,
+                        "note": f"+{pct:.0f}% 减{close_pct:.0f}%",
+                    })
+            if staged_tp_plan:
+                ticket["staged_tp_plan"] = staged_tp_plan
+
         ticket.update(self._template_execution_rules(ticket))
         return ticket
 
@@ -815,8 +1492,7 @@ class TradePipeline:
     ) -> ExecutionResult:
         """Place a real order via OrderManager."""
         try:
-            binance = BinanceClient(self.config.binance, dry_run=False)
-            order_mgr = OrderManager(binance)
+            order_mgr = OrderManager(self.live_client)
 
             side_map = {
                 "open_long":  "BUY",
@@ -833,7 +1509,7 @@ class TradePipeline:
             reduce_only = final_action in _CLOSE_ACTIONS
 
             # fix 1: mark_price() now exists on UMFutures
-            mark_price = self._get_mark_price(binance, symbol)
+            mark_price = self._get_mark_price(self.live_client, symbol)
             if mark_price <= 0:
                 raise ValueError(
                     f"Could not obtain mark price for {symbol} (got {mark_price}). "
@@ -841,7 +1517,7 @@ class TradePipeline:
                 )
 
             # fix 2: get exchange-defined stepSize before computing quantity
-            step_size = binance.futures_client.get_symbol_lot_size(symbol)
+            step_size = self.live_client.futures_client.get_symbol_lot_size(symbol)
 
             # For close actions use actual position size when available
             if final_action in ("close_long", "close_short"):
@@ -874,14 +1550,14 @@ class TradePipeline:
             # fix 1: change_leverage() now exists on UMFutures
             if final_action in ("open_long", "open_short"):
                 try:
-                    binance.futures_client.change_leverage(
+                    self.live_client.futures_client.change_leverage(
                         symbol=symbol, leverage=final_leverage
                     )
                 except Exception as exc:
                     console.print(f"[yellow]Warning: could not set leverage: {exc}[/yellow]")
 
             # fix 3: detect Hedge Mode; use positionSide instead of reduceOnly
-            is_hedge = self._get_position_mode(binance)
+            is_hedge = self._get_position_mode(self.live_client)
             position_side: Optional[str] = (
                 _ACTION_TO_POSITION_SIDE.get(final_action) if is_hedge else None
             )
@@ -906,34 +1582,50 @@ class TradePipeline:
             tp_order_id: Optional[str] = None
 
             # SL/TP only for open actions
+            sl_compensation_needed = False
             if not reduce_only:
-                # Stop-loss
+                # Stop-loss (with retry on failure)
                 if plan.stop_loss_pct > 0:
-                    try:
-                        if side == "BUY":
-                            sl_price = round(mark_price * (1 - plan.stop_loss_pct / 100), 2)
-                            sl_side = "SELL"
-                        else:
-                            sl_price = round(mark_price * (1 + plan.stop_loss_pct / 100), 2)
-                            sl_side = "BUY"
-                        sl_resp = order_mgr.place_stop_market_order(
-                            symbol=symbol,
-                            side=sl_side,
-                            quantity=quantity,
-                            stop_price=sl_price,
-                            reduce_only=not is_hedge,
-                            position_side=position_side,
-                            dry_run=False,
-                        )
-                        if sl_resp:
-                            sl_order_id = str(sl_resp.get("orderId", ""))
-                            order_ids.append(sl_order_id)
-                            sl_status = "placed"
-                        else:
-                            sl_status = "failed"
-                    except Exception as exc:
-                        sl_status = "failed"
-                        console.print(f"[yellow]Warning: stop-loss order failed: {exc}[/yellow]")
+                    if side == "BUY":
+                        sl_price = round(mark_price * (1 - plan.stop_loss_pct / 100), 2)
+                        sl_side = "SELL"
+                    else:
+                        sl_price = round(mark_price * (1 + plan.stop_loss_pct / 100), 2)
+                        sl_side = "BUY"
+
+                    for sl_attempt in range(2):  # max 2 attempts
+                        try:
+                            sl_resp = order_mgr.place_stop_market_order(
+                                symbol=symbol,
+                                side=sl_side,
+                                quantity=quantity,
+                                stop_price=sl_price,
+                                reduce_only=not is_hedge,
+                                position_side=position_side,
+                                dry_run=False,
+                            )
+                            if sl_resp:
+                                sl_order_id = str(sl_resp.get("orderId", ""))
+                                order_ids.append(sl_order_id)
+                                sl_status = "placed"
+                            else:
+                                sl_status = "failed"
+                            break
+                        except Exception as exc:
+                            if sl_attempt == 0:
+                                console.print(f"[yellow]SL order failed, retrying: {exc}[/yellow]")
+                                import time as _t; _t.sleep(0.5)
+                            else:
+                                sl_status = "failed"
+                                sl_compensation_needed = True
+                                console.print(f"[red]CRITICAL: stop-loss order failed after retry: {exc}[/red]")
+                                # Feishu: SL failed critical alert
+                                if self._feishu and self.config.notification.on_sl_tp_trigger:
+                                    self._feishu.notify_sl_failed(
+                                        symbol=symbol,
+                                        action=final_action,
+                                        message=f"SL挂单重试后仍失败: {exc}",
+                                    )
 
                 # Take-profit
                 if plan.take_profit_pct > 0:
@@ -977,6 +1669,17 @@ class TradePipeline:
             msg = f"Order executed: {side} {quantity} {symbol}"
             if attached:
                 msg += f" | {', '.join(attached)}"
+            if sl_compensation_needed:
+                msg += " | WARNING: SL failed - position exposed without stop-loss!"
+
+            # Feishu: execution confirmation
+            if self._feishu and self.config.notification.on_sl_tp_trigger:
+                self._feishu.notify_execution(
+                    symbol=symbol,
+                    action=final_action,
+                    quantity=quantity,
+                    message=msg,
+                )
 
             return ExecutionResult(
                 executed=True,
@@ -1018,6 +1721,7 @@ class TradePipeline:
         timestamp: str,
         account_summary: dict,
         market_snapshot: dict,
+        onchain_snapshot: dict,
         positions: list[dict],
         research: ResearchDecision,
         plan: ExecutionPlan,
@@ -1026,6 +1730,7 @@ class TradePipeline:
         reflections: list[dict],
         portfolio_snapshot: dict,
         portfolio_budget: dict,
+        adaptive_context: dict,
     ) -> Optional[str]:
         try:
             vault = VaultReader(self.config.vault)
@@ -1034,6 +1739,7 @@ class TradePipeline:
                 timestamp=timestamp,
                 account_summary=account_summary,
                 market_snapshot=market_snapshot,
+                onchain_snapshot=onchain_snapshot,
                 positions=positions,
                 research=research,
                 plan=plan,
@@ -1042,6 +1748,7 @@ class TradePipeline:
                 reflections=reflections,
                 portfolio_snapshot=portfolio_snapshot,
                 portfolio_budget=portfolio_budget,
+                adaptive_context=adaptive_context,
             )
             path = vault.write_report(filename=f"交易执行-{symbol}-{timestamp}", content=content)
             console.print(f"[green]✓ Vault report: {path}[/green]")
@@ -1060,6 +1767,7 @@ def _build_report(
     timestamp: str,
     account_summary: dict,
     market_snapshot: dict,
+    onchain_snapshot: dict,
     positions: list[dict],
     research: ResearchDecision,
     plan: ExecutionPlan,
@@ -1068,6 +1776,7 @@ def _build_report(
     reflections: list[dict],
     portfolio_snapshot: dict,
     portfolio_budget: dict,
+    adaptive_context: dict,
 ) -> str:
     mode = "（模拟运行）" if account_summary.get("dry_run") else ""
     lines: list[str] = [
@@ -1110,6 +1819,30 @@ def _build_report(
         f"- 动量状态：{market_snapshot.get('momentum_regime', 'N/A')}",
         f"- 叙事标签：{market_snapshot.get('narrative_tag', 'N/A')}",
         "",
+    ]
+
+    if onchain_snapshot.get("has_onchain_data"):
+        lines += ["## 链上数据快照 (DeFiLlama)\n"]
+        if onchain_snapshot.get("protocol_name"):
+            tvl = onchain_snapshot.get("protocol_tvl_usd")
+            tvl_str = f"${tvl / 1e6:.1f}M" if tvl else "N/A"
+            lines.append(f"- 协议：{onchain_snapshot['protocol_name']} ({onchain_snapshot.get('protocol_category', 'DeFi')})")
+            lines.append(f"- 协议 TVL：{tvl_str}")
+            if onchain_snapshot.get("tvl_change_24h_pct") is not None:
+                lines.append(f"- TVL 24h 变化：{onchain_snapshot['tvl_change_24h_pct']:+.1f}%")
+            if onchain_snapshot.get("tvl_change_7d_pct") is not None:
+                lines.append(f"- TVL 7d 变化：{onchain_snapshot['tvl_change_7d_pct']:+.1f}%")
+            if onchain_snapshot.get("protocol_chains"):
+                lines.append(f"- 部署链：{', '.join(onchain_snapshot['protocol_chains'][:4])}")
+        if onchain_snapshot.get("chain_name") and onchain_snapshot.get("chain_tvl_usd") is not None:
+            chain_tvl = onchain_snapshot["chain_tvl_usd"]
+            lines.append(f"- {onchain_snapshot['chain_name']} 链 TVL：${chain_tvl / 1e9:.2f}B")
+        if onchain_snapshot.get("stablecoin_total_usd") is not None:
+            st = onchain_snapshot["stablecoin_total_usd"]
+            lines.append(f"- 全网稳定币供应：${st / 1e9:.1f}B")
+        lines.append("")
+
+    lines += [
         "## 四、组合层快照\n",
         f"- 总资产：${portfolio_snapshot.get('total_balance_usdt', 0):,.2f}",
         f"- Gross Exposure：{portfolio_snapshot.get('gross_exposure_pct', 0):.1f}%",
@@ -1155,6 +1888,12 @@ def _build_report(
         "## 七、风险审批 (RiskDecision)\n",
         f"- **审批结果**：{'✅ 通过' if risk.approved else '❌ 拒绝'}",
     ]
+    if risk.gating_profile:
+        lines.append(f"- **风险档位**：{risk.gating_profile}")
+    if risk.setup_quality_score is not None:
+        lines.append(
+            f"- **Setup Quality**：{risk.setup_quality_score:.1f}/100 ({risk.setup_quality_grade or '?'})"
+        )
 
     if risk.violated_rules:
         lines.append("- **违规规则**：")
@@ -1201,9 +1940,14 @@ def _build_report(
             if ref.get("reflection_text"):
                 lines.append(f"\n{ref['reflection_text'][:500]}")
 
+    if adaptive_context.get("enabled"):
+        lines += ["", "## 十一、历史自适应提示\n"]
+        for line in adaptive_context.get("guidance_lines", [])[:6]:
+            lines.append(f"- {line}")
+
     lines += [
         "",
-        "## 十一、最终结论\n",
+        "## 十二、最终结论\n",
         f"本次 **{symbol}** 分析完成。",
         f"- AI 研判方向：**{research.stance.upper()}**，信心 {research.confidence:.1%}",
         f"- 建议动作：**{plan.action}**，仓位 {plan.size_pct:.1f}%，杠杆 {plan.leverage}x",
