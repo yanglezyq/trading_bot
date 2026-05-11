@@ -245,7 +245,7 @@ def status(
         table.add_row("Binance API", binance_status)
         table.add_row(
             "Claude API",
-            "Configured" if config.claude.api_key else "Not configured (required for AI trade analysis)",
+            "CLI mode" if config.claude.use_cli else ("API key configured" if config.claude.api_key else "Not configured"),
         )
         if config.trading.auto_execute_kill_switch:
             auto_exec_status = "Blocked by kill switch"
@@ -1319,8 +1319,10 @@ def reflect(
     try:
         config = load_app_config(config_path=config_path)
 
-        if not config.claude.api_key:
-            console.print("[red]Anthropic API key not configured (ANTHROPIC_API_KEY).[/red]")
+        from .ai.client import ClaudeClient as _CC
+        _check_client = _CC(config.claude)
+        if not _check_client.is_configured:
+            console.print("[red]Claude not available: set ANTHROPIC_API_KEY or enable use_cli in config.[/red]")
             raise typer.Exit(1)
 
         from .ai.advisor import TradingAdvisor

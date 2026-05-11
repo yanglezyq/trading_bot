@@ -211,8 +211,7 @@ class TradePipeline:
 
         if not self.claude.is_configured:
             raise RuntimeError(
-                "Anthropic API key not configured (ANTHROPIC_API_KEY). "
-                "Cannot generate research decision."
+                "Claude not available: set ANTHROPIC_API_KEY or enable use_cli in config."
             )
 
         if self.config.claude.ensemble_enabled:

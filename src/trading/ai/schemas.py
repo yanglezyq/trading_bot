@@ -46,6 +46,8 @@ class ResearchDecision:
     @classmethod
     def from_dict(cls, d: dict) -> "ResearchDecision":
         stance = str(d.get("stance", "neutral")).lower()
+        _STANCE_ALIASES = {"bullish": "long", "bearish": "short", "flat": "neutral"}
+        stance = _STANCE_ALIASES.get(stance, stance)
         if stance not in _VALID_STANCES:
             raise ValueError(f"Invalid stance: {stance!r}, must be one of {sorted(_VALID_STANCES)}")
         confidence = float(d.get("confidence", 0.5))

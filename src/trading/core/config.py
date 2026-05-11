@@ -110,6 +110,7 @@ class ClaudeConfig:
 
     api_key: str = ""
     model: str = "claude-sonnet-4-6"
+    use_cli: bool = False
     cache_enabled: bool = True
     cache_ttl_seconds: int = 300
     max_tokens: int = 2000

@@ -5,7 +5,7 @@
 
 # Obsidian Vault Configuration
 vault:
-  path: "/Users/shuchang/Documents/Obsidian Vault"
+  path: "/Users/rong/Documents/Obsidian Vault"
   trading_dir: "体系化交易"
 
   # Subdirectories for reading/writing
@@ -120,6 +120,9 @@ binance:
 
 # Claude AI Configuration (from .env)
 claude:
+  # Use Claude Code CLI instead of API key (runs via `claude -p`)
+  use_cli: true
+
   # Model to use
   model: "claude-sonnet-4-6"
 
